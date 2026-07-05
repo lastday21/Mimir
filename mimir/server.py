@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+import json
+import mimetypes
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from .config import AppConfig, load_config, save_config
+from .credentials import read_secret, write_secret
+from .models import ChatMessage, ModelInfo
+from .ollama_fallback import select_preferred_model, sort_models
+from .prompts import build_messages
+from .providers import OllamaClient, YandexAIStudioClient
+from .providers.base import ProviderError
+from .question_detector import detect_questions
+
+
+HOST = "127.0.0.1"
+PORT = 8765
+STATIC_ROOT = Path(__file__).resolve().parents[1] / "dist"
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    server_version = "MimirPython/0.1"
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self.send_json({"ok": True})
+            return
+        if parsed.path == "/api/config":
+            self.send_json(config_payload(load_config()))
+            return
+        if parsed.path == "/api/models":
+            self.handle_models()
+            return
+        self.handle_static(parsed.path)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/api/config":
+                self.handle_save_config()
+            elif parsed.path == "/api/credentials/yandex":
+                self.handle_yandex_key()
+            elif parsed.path == "/api/detect":
+                self.handle_detect()
+            elif parsed.path == "/api/ask":
+                self.handle_ask()
+            else:
+                self.send_error(404)
+        except ProviderError as error:
+            self.send_json({"error": str(error)}, status=502)
+        except ValueError as error:
+            self.send_json({"error": str(error)}, status=400)
+        except Exception as error:
+            self.send_json({"error": str(error)}, status=500)
+
+    def handle_save_config(self) -> None:
+        payload = self.read_json()
+        config = AppConfig.from_dict(payload)
+        save_config(config)
+        self.send_json(config_payload(config))
+
+    def handle_yandex_key(self) -> None:
+        payload = self.read_json()
+        key = str(payload.get("apiKey") or "").strip()
+        if not key:
+            raise ValueError("apiKey is required")
+        write_secret("yandex_ai_studio", key)
+        write_secret("yandex_speechkit", key)
+        self.send_json({"stored": True})
+
+    def handle_models(self) -> None:
+        config = load_config()
+        if config.llm_provider == "ollama":
+            models = sort_models(OllamaClient(config.ollama_base_url).list_models())
+        else:
+            key = read_secret("yandex_ai_studio") or ""
+            models = YandexAIStudioClient(key, config.yandex_folder_id).list_models()
+        preferred = select_preferred_model(models) if config.llm_provider == "ollama" else None
+        self.send_json(
+            {
+                "models": [model_payload(model) for model in models],
+                "preferredModel": preferred.id if preferred else None,
+            }
+        )
+
+    def handle_detect(self) -> None:
+        payload = self.read_json()
+        text = str(payload.get("text") or "")
+        questions = detect_questions(text)
+        self.send_json(
+            {
+                "questions": [
+                    {
+                        "text": question.text,
+                        "confidence": question.confidence,
+                        "timestampMs": question.timestamp_ms,
+                        "source": question.source,
+                    }
+                    for question in questions
+                ]
+            }
+        )
+
+    def handle_ask(self) -> None:
+        payload = self.read_json()
+        question = str(payload.get("question") or "").strip()
+        transcript = str(payload.get("transcript") or "")
+        if not question:
+            raise ValueError("question is required")
+        config = load_config()
+        messages = build_messages(question, transcript)
+        if config.llm_provider == "ollama":
+            answer = OllamaClient(config.ollama_base_url).chat(config.llm_model, messages)
+        else:
+            key = read_secret("yandex_ai_studio") or ""
+            answer = YandexAIStudioClient(key, config.yandex_folder_id).chat(config.llm_model, messages)
+        self.send_json({"answer": answer})
+
+    def read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("JSON object expected")
+        return data
+
+    def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:5173")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def handle_static(self, request_path: str) -> None:
+        if not STATIC_ROOT.exists():
+            self.send_error(404, "Frontend build not found. Run npm run build.")
+            return
+
+        relative = request_path.lstrip("/") or "index.html"
+        target = (STATIC_ROOT / relative).resolve()
+        static_root = STATIC_ROOT.resolve()
+        if static_root not in target.parents and target != static_root:
+            self.send_error(403)
+            return
+        if target.is_dir():
+            target = target / "index.html"
+        if not target.exists():
+            target = static_root / "index.html"
+
+        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:5173")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def config_payload(config: AppConfig) -> dict[str, Any]:
+    return {
+        "yandexFolderId": config.yandex_folder_id,
+        "llmProvider": config.llm_provider,
+        "llmModel": config.llm_model,
+        "ollamaBaseUrl": config.ollama_base_url,
+        "hasYandexKey": bool(read_secret("yandex_ai_studio")),
+    }
+
+
+def model_payload(model: ModelInfo) -> dict[str, Any]:
+    return {
+        "id": model.id,
+        "name": model.name,
+        "provider": model.provider,
+        "contextWindow": model.context_window,
+    }
+
+
+def main() -> None:
+    server = ThreadingHTTPServer((HOST, PORT), ApiHandler)
+    print(f"Mimir Python API listening on http://{HOST}:{PORT}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
