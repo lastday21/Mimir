@@ -9,9 +9,11 @@ description = "Meeting assistant with a Python backend and React frontend"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Mimir contributors" }]
+dependencies = ["pywebview>=5.4"]
 
 [project.scripts]
 mimir = "mimir.server:main"
+mimir-desktop = "mimir.desktop:main"
 
 [tool.setuptools.packages.find]
 include = ["mimir*"]

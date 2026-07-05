@@ -132,6 +132,13 @@ button {
   cursor: pointer;
 }
 
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
 button:hover:not(:disabled) {
   background: #263146;
 }
@@ -154,6 +161,15 @@ button:disabled {
   background: #3d7df7;
 }
 
+.danger {
+  background: #8f2d3a;
+  border-color: #b43a4b;
+}
+
+.danger:hover:not(:disabled) {
+  background: #a73545;
+}
+
 .model-list {
   margin-top: 12px;
 }
@@ -168,6 +184,13 @@ textarea {
   resize: vertical;
   min-height: 270px;
   line-height: 1.5;
+}
+
+.transcript-actions {
+  display: grid;
+  grid-template-columns: auto minmax(130px, 180px) auto;
+  gap: 10px;
+  margin-top: 12px;
 }
 
 .question-box {

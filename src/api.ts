@@ -72,3 +72,24 @@ export function askMimir(question: string, transcript: string): Promise<{ answer
     body: JSON.stringify({ question, transcript })
   });
 }
+
+export async function transcribeYandexSpeech(
+  audio: Blob,
+  language: string,
+  sampleRate = 16000
+): Promise<{ text: string }> {
+  const response = await fetch("/api/stt/yandex", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Mimir-Language": language,
+      "X-Mimir-Sample-Rate": String(sampleRate)
+    },
+    body: audio
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || `Request failed: ${response.status}`);
+  }
+  return data as { text: string };
+}

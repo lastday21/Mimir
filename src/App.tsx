@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Bot, Check, Cloud, KeyRound, Loader2, MessageSquare, Server, Sparkles } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Bot, Check, Cloud, KeyRound, Loader2, MessageSquare, Mic, Server, Sparkles, Square } from "lucide-react";
 import {
   AppConfig,
   DetectedQuestion,
@@ -9,8 +9,12 @@ import {
   getConfig,
   listModels,
   saveConfig,
-  storeYandexKey
+  storeYandexKey,
+  transcribeYandexSpeech
 } from "./api";
+
+const STT_SAMPLE_RATE = 16000;
+const MAX_RECORDING_SECONDS = 30;
 
 const DEFAULT_CONFIG: AppConfig = {
   yandexFolderId: "",
@@ -30,6 +34,21 @@ export function App() {
   const [answer, setAnswer] = useState("");
   const [status, setStatus] = useState("Start the Python API with python -m mimir");
   const [busy, setBusy] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [sttLanguage, setSttLanguage] = useState("ru-RU");
+
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const gainRef = useRef<GainNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Float32Array[]>([]);
+  const inputSampleRateRef = useRef(STT_SAMPLE_RATE);
+  const timerRef = useRef<number | null>(null);
+  const autoStopRef = useRef<number | null>(null);
+  const recordingStartedAtRef = useRef(0);
+  const recordingActiveRef = useRef(false);
 
   useEffect(() => {
     getConfig()
@@ -38,6 +57,12 @@ export function App() {
         setStatus("Python API connected");
       })
       .catch((error) => setStatus(error.message));
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      cleanupRecording();
+    };
   }, []);
 
   const providerIcon = useMemo(() => {
@@ -93,6 +118,43 @@ export function App() {
       setStatus(`Detected ${payload.questions.length} questions`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Question detection failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleStartRecording() {
+    setBusy(true);
+    try {
+      await startRecording();
+      setStatus("Recording microphone");
+    } catch (error) {
+      cleanupRecording();
+      setStatus(error instanceof Error ? error.message : "Microphone recording failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleStopRecording() {
+    if (!recordingActiveRef.current) return;
+    setBusy(true);
+    try {
+      const audio = await stopRecording();
+      if (!audio || audio.size === 0) {
+        setStatus("No microphone audio captured");
+        return;
+      }
+      setStatus("Transcribing with Yandex SpeechKit");
+      const payload = await transcribeYandexSpeech(audio, sttLanguage, STT_SAMPLE_RATE);
+      if (!payload.text) {
+        setStatus("SpeechKit returned no text");
+        return;
+      }
+      setTranscript((current) => joinTranscript(current, payload.text));
+      setStatus("Speech transcript added");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Speech transcription failed");
     } finally {
       setBusy(false);
     }
@@ -189,7 +251,18 @@ export function App() {
             onChange={(event) => setTranscript(event.target.value)}
             placeholder="Paste meeting or interview transcript here..."
           />
-          <button onClick={handleDetect} disabled={busy}>Detect questions</button>
+          <div className="transcript-actions">
+            <button className={recording ? "danger" : ""} onClick={recording ? handleStopRecording : handleStartRecording} disabled={busy}>
+              {recording ? <Square size={16} /> : <Mic size={16} />}
+              {recording ? `Stop ${recordingSeconds}s` : "Record mic"}
+            </button>
+            <select value={sttLanguage} onChange={(event) => setSttLanguage(event.target.value)} disabled={busy || recording}>
+              <option value="ru-RU">Russian</option>
+              <option value="en-US">English</option>
+              <option value="tr-TR">Turkish</option>
+            </select>
+            <button onClick={handleDetect} disabled={busy}>Detect questions</button>
+          </div>
           <div className="questions">
             {questions.map((item, index) => (
               <button key={`${item.text}-${index}`} onClick={() => setQuestion(item.text)}>
@@ -220,4 +293,137 @@ export function App() {
       </section>
     </main>
   );
+
+  async function startRecording() {
+    const audioContextCtor = window.AudioContext || getWebkitAudioContext();
+    if (!audioContextCtor) {
+      throw new Error("This browser does not support microphone recording");
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+    const audioContext = new audioContextCtor({ sampleRate: STT_SAMPLE_RATE });
+    const source = audioContext.createMediaStreamSource(stream);
+    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    const gain = audioContext.createGain();
+    gain.gain.value = 0;
+
+    audioChunksRef.current = [];
+    inputSampleRateRef.current = audioContext.sampleRate;
+    recordingStartedAtRef.current = Date.now();
+    processor.onaudioprocess = (event) => {
+      audioChunksRef.current.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+
+    source.connect(processor);
+    processor.connect(gain);
+    gain.connect(audioContext.destination);
+
+    audioContextRef.current = audioContext;
+    sourceRef.current = source;
+    processorRef.current = processor;
+    gainRef.current = gain;
+    streamRef.current = stream;
+    recordingActiveRef.current = true;
+    setRecordingSeconds(0);
+    setRecording(true);
+    timerRef.current = window.setInterval(() => {
+      const elapsed = Math.floor((Date.now() - recordingStartedAtRef.current) / 1000);
+      setRecordingSeconds(Math.min(elapsed, MAX_RECORDING_SECONDS));
+    }, 250);
+    autoStopRef.current = window.setTimeout(() => {
+      void handleStopRecording();
+    }, MAX_RECORDING_SECONDS * 1000);
+  }
+
+  async function stopRecording(): Promise<Blob | null> {
+    const chunks = audioChunksRef.current;
+    const inputSampleRate = inputSampleRateRef.current;
+    cleanupRecording();
+    if (chunks.length === 0) {
+      return null;
+    }
+    const samples = mergeSamples(chunks);
+    const resampled = inputSampleRate === STT_SAMPLE_RATE ? samples : resampleLinear(samples, inputSampleRate, STT_SAMPLE_RATE);
+    return new Blob([encodePcm16(resampled)], { type: "application/octet-stream" });
+  }
+
+  function cleanupRecording() {
+    if (timerRef.current !== null) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    if (autoStopRef.current !== null) {
+      window.clearTimeout(autoStopRef.current);
+      autoStopRef.current = null;
+    }
+    processorRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+    gainRef.current?.disconnect();
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    void audioContextRef.current?.close();
+    recordingActiveRef.current = false;
+    audioContextRef.current = null;
+    sourceRef.current = null;
+    processorRef.current = null;
+    gainRef.current = null;
+    streamRef.current = null;
+    setRecording(false);
+    setRecordingSeconds(0);
+  }
+}
+
+function getWebkitAudioContext(): typeof AudioContext | undefined {
+  return (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+}
+
+function joinTranscript(current: string, addition: string): string {
+  const trimmedCurrent = current.trim();
+  const trimmedAddition = addition.trim();
+  if (!trimmedCurrent) return trimmedAddition;
+  return `${trimmedCurrent}\n${trimmedAddition}`;
+}
+
+function mergeSamples(chunks: Float32Array[]): Float32Array {
+  const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const result = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+function resampleLinear(samples: Float32Array, sourceRate: number, targetRate: number): Float32Array {
+  if (samples.length === 0 || sourceRate === targetRate) {
+    return samples;
+  }
+  const ratio = sourceRate / targetRate;
+  const newLength = Math.floor(samples.length / ratio);
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i += 1) {
+    const sourceIndex = i * ratio;
+    const left = Math.floor(sourceIndex);
+    const right = Math.min(left + 1, samples.length - 1);
+    const weight = sourceIndex - left;
+    result[i] = samples[left] * (1 - weight) + samples[right] * weight;
+  }
+  return result;
+}
+
+function encodePcm16(samples: Float32Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(samples.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < samples.length; i += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  return buffer;
 }

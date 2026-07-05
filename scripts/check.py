@@ -16,6 +16,8 @@ def run(command: list[str]) -> None:
 def main() -> int:
     if not compileall.compile_dir(ROOT / "mimir", quiet=1):
         return 1
+    if not compileall.compile_dir(ROOT / "scripts", quiet=1):
+        return 1
     if not compileall.compile_dir(ROOT / "tests", quiet=1):
         return 1
     run([sys.executable, "-m", "unittest", "discover", "-s", "tests"])
