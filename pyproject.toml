@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mimir"
 version = "0.1.0"
-description = "Meeting assistant with a Python backend and React frontend"
+description = "Realtime interview assistant core with a Python backend"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Mimir contributors" }]

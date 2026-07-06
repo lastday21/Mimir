@@ -15,11 +15,34 @@ export interface ModelInfo {
   contextWindow: number | null;
 }
 
-export interface DetectedQuestion {
+export interface SessionSnapshot {
+  sessionId: string;
+  state: string;
+  memory: {
+    activeTopic: string;
+    turns: TranscriptTurn[];
+    questions: string[];
+  };
+  metrics: Record<string, unknown>;
+}
+
+export interface TranscriptTurn {
+  source: "remote" | "mic";
   text: string;
-  confidence: number;
+  isFinal: boolean;
   timestampMs: number;
-  source: string;
+}
+
+export interface QuestionEvent {
+  sessionId: string;
+  questionId: string;
+  question: string;
+  confidence: number;
+  reason: string;
+  context?: {
+    activeTopic: string;
+    priorQuestions: string[];
+  };
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -59,37 +82,28 @@ export function listModels(): Promise<{ models: ModelInfo[]; preferredModel: str
   return request<{ models: ModelInfo[]; preferredModel: string | null }>("/api/models");
 }
 
-export function detectQuestions(text: string): Promise<{ questions: DetectedQuestion[] }> {
-  return request<{ questions: DetectedQuestion[] }>("/api/detect", {
-    method: "POST",
-    body: JSON.stringify({ text })
+export function startSession(): Promise<SessionSnapshot> {
+  return request<SessionSnapshot>("/api/session/start", {
+    method: "POST"
   });
 }
 
-export function askMimir(question: string, transcript: string): Promise<{ answer: string }> {
-  return request<{ answer: string }>("/api/ask", {
-    method: "POST",
-    body: JSON.stringify({ question, transcript })
+export function stopSession(): Promise<SessionSnapshot> {
+  return request<SessionSnapshot>("/api/session/stop", {
+    method: "POST"
   });
 }
 
-export async function transcribeYandexSpeech(
-  audio: Blob,
-  language: string,
-  sampleRate = 16000
-): Promise<{ text: string }> {
-  const response = await fetch("/api/stt/yandex", {
+export function sendTranscript(source: "remote" | "mic", text: string, isFinal = true): Promise<TranscriptTurn> {
+  return request<TranscriptTurn>("/api/session/transcript", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "X-Mimir-Language": language,
-      "X-Mimir-Sample-Rate": String(sampleRate)
-    },
-    body: audio
+    body: JSON.stringify({ source, text, isFinal })
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(data.error || `Request failed: ${response.status}`);
-  }
-  return data as { text: string };
+}
+
+export function askManualQuestion(question: string): Promise<QuestionEvent> {
+  return request<QuestionEvent>("/api/manual/question", {
+    method: "POST",
+    body: JSON.stringify({ question })
+  });
 }

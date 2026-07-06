@@ -5,23 +5,22 @@ import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .config import AppConfig, load_config, save_config
 from .credentials import read_secret, write_secret
 from .models import ModelInfo
 from .ollama_fallback import select_preferred_model, sort_models
-from .prompts import build_messages
-from .providers import OllamaClient, YandexAIStudioClient, YandexSpeechKitClient
+from .providers import OllamaClient, YandexAIStudioClient
 from .providers.base import ProviderError
-from .providers.yandex_speechkit import DEFAULT_SAMPLE_RATE, MAX_SHORT_AUDIO_BYTES
-from .question_detector import detect_questions
+from .session import SessionManager, sse_payload
 
 
 HOST = "127.0.0.1"
 PORT = 8765
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "dist"
-ALLOWED_CORS_HEADERS = "Content-Type, X-Mimir-Language, X-Mimir-Sample-Rate"
+ALLOWED_CORS_HEADERS = "Content-Type"
+SESSION_MANAGER = SessionManager()
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -38,6 +37,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/models":
             self.handle_models()
             return
+        if parsed.path == "/api/metrics/current":
+            self.send_json(SESSION_MANAGER.metrics())
+            return
+        if parsed.path == "/api/session/events":
+            self.handle_session_events(parsed.query)
+            return
         self.handle_static(parsed.path)
 
     def do_POST(self) -> None:
@@ -47,12 +52,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.handle_save_config()
             elif parsed.path == "/api/credentials/yandex":
                 self.handle_yandex_key()
-            elif parsed.path == "/api/detect":
-                self.handle_detect()
-            elif parsed.path == "/api/ask":
-                self.handle_ask()
-            elif parsed.path == "/api/stt/yandex":
-                self.handle_yandex_stt()
+            elif parsed.path == "/api/session/start":
+                self.send_json(SESSION_MANAGER.start())
+            elif parsed.path == "/api/session/stop":
+                self.send_json(SESSION_MANAGER.stop())
+            elif parsed.path == "/api/session/transcript":
+                self.handle_session_transcript()
+            elif parsed.path == "/api/manual/question":
+                self.handle_manual_question()
             else:
                 self.send_error(404)
         except ProviderError as error:
@@ -92,50 +99,39 @@ class ApiHandler(BaseHTTPRequestHandler):
             }
         )
 
-    def handle_detect(self) -> None:
+    def handle_session_transcript(self) -> None:
         payload = self.read_json()
+        source = str(payload.get("source") or "")
         text = str(payload.get("text") or "")
-        questions = detect_questions(text)
-        self.send_json(
-            {
-                "questions": [
-                    {
-                        "text": question.text,
-                        "confidence": question.confidence,
-                        "timestampMs": question.timestamp_ms,
-                        "source": question.source,
-                    }
-                    for question in questions
-                ]
-            }
-        )
+        is_final = bool(payload.get("isFinal", True))
+        self.send_json(SESSION_MANAGER.ingest_transcript(source, text, is_final=is_final))
 
-    def handle_ask(self) -> None:
+    def handle_manual_question(self) -> None:
         payload = self.read_json()
         question = str(payload.get("question") or "").strip()
-        transcript = str(payload.get("transcript") or "")
-        if not question:
-            raise ValueError("question is required")
-        config = load_config()
-        messages = build_messages(question, transcript)
-        if config.llm_provider == "ollama":
-            answer = OllamaClient(config.ollama_base_url).chat(config.llm_model, messages)
-        else:
-            key = read_secret("yandex_ai_studio") or ""
-            answer = YandexAIStudioClient(key, config.yandex_folder_id).chat(config.llm_model, messages)
-        self.send_json({"answer": answer})
+        self.send_json(SESSION_MANAGER.manual_question(question))
 
-    def handle_yandex_stt(self) -> None:
-        audio = self.read_body(MAX_SHORT_AUDIO_BYTES)
-        language = self.headers.get("X-Mimir-Language", "ru-RU")
-        sample_rate = int(self.headers.get("X-Mimir-Sample-Rate", str(DEFAULT_SAMPLE_RATE)))
-        key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
-        text = YandexSpeechKitClient(key).recognize_lpcm(
-            audio,
-            language=language,
-            sample_rate_hertz=sample_rate,
-        )
-        self.send_json({"text": text})
+    def handle_session_events(self, query: str) -> None:
+        params = parse_qs(query)
+        after = 0
+        if params.get("after"):
+            try:
+                after = int(params["after"][0])
+            except ValueError:
+                after = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:5173")
+        self.send_header("Access-Control-Allow-Headers", ALLOWED_CORS_HEADERS)
+        self.end_headers()
+        try:
+            for event in SESSION_MANAGER.listen(after=after):
+                self.wfile.write(sse_payload(event))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -146,14 +142,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             raise ValueError("JSON object expected")
         return data
-
-    def read_body(self, max_bytes: int) -> bytes:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
-            raise ValueError("Request body is empty")
-        if length > max_bytes:
-            raise ValueError(f"Request body is too large: {length} bytes")
-        return self.rfile.read(length)
 
     def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")

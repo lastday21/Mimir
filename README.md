@@ -1,9 +1,10 @@
 # Mimir
 
-Mimir is a React and TypeScript meeting assistant with a Python backend.
+Mimir is a Python-backed realtime assistant core for interviews and live calls.
 
-The frontend runs through Vite. The backend exposes a small local HTTP API for
-settings, model discovery, question detection, and assistant answers.
+The backend owns the session pipeline: dialogue memory, question/follow-up
+triggering, context assembly, provider selection, and streaming answer events.
+The current frontend is a development client for that pipeline.
 
 ## Desktop App
 
@@ -17,14 +18,24 @@ npm install
 ```
 
 The desktop launcher builds the React frontend when `dist/` is missing, starts
-the Python API on a local random port, and opens Mimir in a native webview
-window.
+the Python API on a local random port, and opens the local client in a native
+webview window.
 
-## Speech Recognition
+## Realtime Session Core
 
-The transcript panel can record up to 30 seconds from the microphone and send
-16 kHz mono LPCM audio to Yandex SpeechKit. The recognized text is appended to
-the transcript and can then be used for question detection or Ask Mimir.
+The main path is no longer a manual record/detect/ask flow. The backend exposes
+a session API:
+
+- `POST /api/session/start`
+- `POST /api/session/stop`
+- `GET /api/session/events`
+- `POST /api/session/transcript`
+- `POST /api/manual/question`
+
+`/api/session/transcript` is a development input until the continuous Python
+audio capture path is wired in. It already feeds the same dialogue memory,
+question trigger, context builder, and streaming LLM path that live audio will
+use.
 
 ## Development
 
