@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,10 @@ from .config import AppConfig, load_config, save_config
 from .credentials import read_secret, write_secret
 from .models import ModelInfo
 from .ollama_fallback import select_preferred_model, sort_models
-from .providers import OllamaClient, YandexAIStudioClient
+from .providers import OllamaClient, YandexAIStudioClient, YandexSpeechKitClient
 from .providers.base import ProviderError
 from .session import SessionManager, sse_payload
+from .stt import AudioStreamConfig, SpeechKitStreamRunner, pcm_chunks_from_wav
 
 
 HOST = "127.0.0.1"
@@ -21,6 +23,7 @@ PORT = 8765
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "dist"
 ALLOWED_CORS_HEADERS = "Content-Type"
 SESSION_MANAGER = SessionManager()
+MAX_DEV_WAV_BYTES = 25_000_000
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -58,6 +61,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(SESSION_MANAGER.stop())
             elif parsed.path == "/api/session/transcript":
                 self.handle_session_transcript()
+            elif parsed.path == "/api/session/stt/wav":
+                self.handle_session_stt_wav(parsed.query)
             elif parsed.path == "/api/manual/question":
                 self.handle_manual_question()
             else:
@@ -111,6 +116,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         question = str(payload.get("question") or "").strip()
         self.send_json(SESSION_MANAGER.manual_question(question))
 
+    def handle_session_stt_wav(self, query: str) -> None:
+        params = parse_qs(query)
+        source = str(params.get("source", ["remote"])[0])
+        language = str(params.get("language", ["ru-RU"])[0])
+        chunk_duration_ms = int(str(params.get("chunkMs", ["400"])[0]))
+        data = self.read_body(MAX_DEV_WAV_BYTES)
+        key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
+        job_id = f"stt_wav_{id(data):x}"
+
+        thread = threading.Thread(
+            target=run_wav_stt_job,
+            args=(job_id, source, language, chunk_duration_ms, data, key),
+            name=job_id,
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"started": True, "jobId": job_id})
+
     def handle_session_events(self, query: str) -> None:
         params = parse_qs(query)
         after = 0
@@ -142,6 +165,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             raise ValueError("JSON object expected")
         return data
+
+    def read_body(self, max_bytes: int) -> bytes:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            raise ValueError("Request body is empty")
+        if length > max_bytes:
+            raise ValueError(f"Request body is too large: {length} bytes")
+        return self.rfile.read(length)
 
     def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -206,6 +237,38 @@ def model_payload(model: ModelInfo) -> dict[str, Any]:
         "provider": model.provider,
         "contextWindow": model.context_window,
     }
+
+
+def run_wav_stt_job(job_id: str, source: str, language: str, chunk_duration_ms: int, data: bytes, key: str) -> None:
+    try:
+        SESSION_MANAGER.start()
+        sample_rate, chunks = pcm_chunks_from_wav(data, chunk_duration_ms=chunk_duration_ms)
+        config = AudioStreamConfig(
+            language=language,
+            sample_rate_hertz=sample_rate,
+            chunk_duration_ms=chunk_duration_ms,
+        )
+        SESSION_MANAGER.publish_status(
+            "stt_status",
+            {
+                "jobId": job_id,
+                "source": source,
+                "status": "streaming",
+                "sampleRateHertz": sample_rate,
+            },
+        )
+        runner = SpeechKitStreamRunner(YandexSpeechKitClient(key), config)
+        for event in runner.run(source, chunks):
+            SESSION_MANAGER.ingest_transcript(event.source, event.text, is_final=event.is_final)
+        SESSION_MANAGER.publish_status(
+            "stt_status",
+            {"jobId": job_id, "source": source, "status": "done"},
+        )
+    except Exception as error:
+        SESSION_MANAGER.publish_status(
+            "stt_error",
+            {"jobId": job_id, "source": source, "error": str(error)},
+        )
 
 
 def create_server(host: str = HOST, port: int = PORT) -> ThreadingHTTPServer:

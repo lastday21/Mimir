@@ -86,6 +86,9 @@ class SessionManager:
             raise ValueError("question is required")
         return self.trigger_question(text, confidence=1.0, reason="manual")
 
+    def publish_status(self, event: str, payload: dict[str, Any]) -> None:
+        self._publish(event, payload)
+
     def metrics(self) -> dict[str, Any]:
         with self._condition:
             return dict(self._metrics)

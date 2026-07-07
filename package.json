@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "smoke": "npm run typecheck && npm audit --omit=dev --audit-level=high && npm run build",
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1"
   },

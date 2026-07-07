@@ -107,3 +107,23 @@ export function askManualQuestion(question: string): Promise<QuestionEvent> {
     body: JSON.stringify({ question })
   });
 }
+
+export async function uploadSpeechWav(
+  source: "remote" | "mic",
+  file: File,
+  language = "ru-RU"
+): Promise<{ started: true; jobId: string }> {
+  const params = new URLSearchParams({ source, language });
+  const response = await fetch(`/api/session/stt/wav?${params.toString()}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "audio/wav"
+    },
+    body: file
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || `Request failed: ${response.status}`);
+  }
+  return data as { started: true; jobId: string };
+}

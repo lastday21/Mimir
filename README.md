@@ -30,12 +30,20 @@ a session API:
 - `POST /api/session/stop`
 - `GET /api/session/events`
 - `POST /api/session/transcript`
+- `POST /api/session/stt/wav`
 - `POST /api/manual/question`
 
 `/api/session/transcript` is a development input until the continuous Python
 audio capture path is wired in. It already feeds the same dialogue memory,
 question trigger, context builder, and streaming LLM path that live audio will
 use.
+
+SpeechKit streaming uses direct SpeechKit v3 gRPC through the generated stubs
+from the `yandexcloud` package.
+
+`POST /api/session/stt/wav` accepts a mono 16-bit PCM WAV file as a development
+feeder. It streams recognition results into the same session memory and question
+trigger path that live mic/loopback capture will use.
 
 ## Development
 

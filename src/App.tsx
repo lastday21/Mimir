@@ -13,7 +13,8 @@ import {
   sendTranscript,
   startSession,
   stopSession,
-  storeYandexKey
+  storeYandexKey,
+  uploadSpeechWav
 } from "./api";
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -36,6 +37,7 @@ export function App() {
   const [source, setSource] = useState<"remote" | "mic">("remote");
   const [utterance, setUtterance] = useState("");
   const [manualQuestion, setManualQuestion] = useState("");
+  const [wavFile, setWavFile] = useState<File | null>(null);
   const [status, setStatus] = useState("Start the Python API with python -m mimir");
   const [busy, setBusy] = useState(false);
 
@@ -84,6 +86,16 @@ export function App() {
     });
 
     events.addEventListener("answer_error", (event) => {
+      const payload = parseEvent<{ error: string }>(event);
+      setStatus(payload.error);
+    });
+
+    events.addEventListener("stt_status", (event) => {
+      const payload = parseEvent<{ status: string; source: string }>(event);
+      setStatus(`STT ${payload.source} ${payload.status}`);
+    });
+
+    events.addEventListener("stt_error", (event) => {
       const payload = parseEvent<{ error: string }>(event);
       setStatus(payload.error);
     });
@@ -197,6 +209,20 @@ export function App() {
     }
   }
 
+  async function handleUploadWav() {
+    if (!wavFile) return;
+    setBusy(true);
+    try {
+      const payload = await uploadSpeechWav(source, wavFile);
+      setWavFile(null);
+      setStatus(`STT job started: ${payload.jobId}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to upload WAV");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main>
       <header className="app-header">
@@ -302,6 +328,17 @@ export function App() {
             onChange={(event) => setUtterance(event.target.value)}
             placeholder="Type a remote or mic phrase for pipeline testing..."
           />
+          <div className="wav-row">
+            <input
+              type="file"
+              accept=".wav,audio/wav"
+              onChange={(event) => setWavFile(event.target.files?.[0] ?? null)}
+            />
+            <button onClick={handleUploadWav} disabled={busy || !wavFile}>
+              <Send size={16} />
+              Stream WAV
+            </button>
+          </div>
           <div className="turns">
             {turns.map((turn, index) => (
               <div className={`turn ${turn.source}`} key={`${turn.timestampMs}-${index}`}>

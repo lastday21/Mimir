@@ -222,6 +222,13 @@ textarea {
   grid-template-columns: 1fr auto;
 }
 
+.wav-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  margin-top: 12px;
+}
+
 .utterance-box {
   min-height: 110px;
 }

@@ -1,7 +1,15 @@
 import unittest
 
 from mimir.providers.base import ProviderError
-from mimir.providers.yandex_speechkit import YandexSpeechKitClient, normalize_language
+from mimir.providers.yandex_speechkit import (
+    YandexSpeechKitClient,
+    build_streaming_requests,
+    first_text,
+    normalize_language,
+    parse_streaming_response,
+)
+
+from yandex.cloud.ai.stt.v3 import stt_pb2
 
 
 class YandexSpeechKitTests(unittest.TestCase):
@@ -20,6 +28,34 @@ class YandexSpeechKitTests(unittest.TestCase):
                 b"\0\0",
                 sample_rate_hertz=44_100,
             )
+
+    def test_extracts_first_streaming_alternative(self) -> None:
+        self.assertEqual(first_text(["hello", "ignored"]), "hello")
+        self.assertEqual(first_text([stt_pb2.Alternative(text="hello")]), "hello")
+        self.assertEqual(first_text("привет"), "привет")
+
+    def test_builds_grpc_streaming_options_before_audio_chunks(self) -> None:
+        requests = list(build_streaming_requests(stt_pb2, [b"1234"], "ru", 16_000))
+
+        self.assertEqual(requests[0].WhichOneof("Event"), "session_options")
+        self.assertEqual(requests[1].WhichOneof("Event"), "chunk")
+        model = requests[0].session_options.recognition_model
+        self.assertEqual(model.audio_processing_type, stt_pb2.RecognitionModelOptions.REAL_TIME)
+        self.assertEqual(model.audio_format.raw_audio.audio_encoding, stt_pb2.RawAudio.LINEAR16_PCM)
+        self.assertEqual(model.language_restriction.language_code[0], "ru-RU")
+
+    def test_parses_grpc_final_response(self) -> None:
+        response = stt_pb2.StreamingResponse(
+            final=stt_pb2.AlternativeUpdate(
+                alternatives=[stt_pb2.Alternative(text="готово")]
+            )
+        )
+
+        result = parse_streaming_response(response)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.text, "готово")
+        self.assertTrue(result.is_final)
 
 
 if __name__ == "__main__":

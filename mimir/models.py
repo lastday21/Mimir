@@ -15,3 +15,11 @@ class ModelInfo:
 class ChatMessage:
     role: str
     content: str
+
+
+@dataclass(frozen=True)
+class SpeechRecognitionResult:
+    text: str
+    is_final: bool
+    end_of_utterance: bool = False
+    confidence: float | None = None
