@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Bot, Check, Cloud, KeyRound, Loader2, MessageSquare, Play, Send, Server, Square, Zap } from "lucide-react";
+import { Bot, Check, Cloud, KeyRound, Loader2, MessageSquare, Pause, Play, Send, Server, Square, Zap } from "lucide-react";
 import {
   AppConfig,
   ModelInfo,
@@ -27,6 +27,8 @@ const DEFAULT_CONFIG: AppConfig = {
   hasYandexKey: false
 };
 
+const IS_OVERLAY = window.location.hash === "#overlay";
+
 export function App() {
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
   const [apiKey, setApiKey] = useState("");
@@ -45,6 +47,11 @@ export function App() {
   const [audioRunning, setAudioRunning] = useState(false);
   const [status, setStatus] = useState("Start the Python API with python -m mimir");
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    document.body.classList.toggle("overlay-body", IS_OVERLAY);
+    return () => document.body.classList.remove("overlay-body");
+  }, []);
 
   useEffect(() => {
     getConfig()
@@ -234,6 +241,14 @@ export function App() {
     }
   }
 
+  async function handleToggleLiveAudio() {
+    if (audioRunning) {
+      await handleStopLiveAudio();
+      return;
+    }
+    await handleStartLiveAudio();
+  }
+
   async function handleSendTranscript() {
     if (!utterance.trim()) return;
     setBusy(true);
@@ -273,6 +288,35 @@ export function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  if (IS_OVERLAY) {
+    return (
+      <main className="overlay-shell">
+        <header className="overlay-header">
+          <span className={`overlay-dot ${audioRunning ? "active" : ""}`} />
+          <span>{status}</span>
+          {busy && <Loader2 className="spin" size={14} />}
+        </header>
+
+        <section className="overlay-question">
+          <small>Вопрос</small>
+          <p>{currentQuestion || "Жду вопрос собеседника."}</p>
+        </section>
+
+        <section className="overlay-answer">
+          {answer || "Ответ появится здесь автоматически."}
+        </section>
+
+        <footer className="overlay-actions">
+          <button onClick={handleToggleLiveAudio} disabled={busy}>
+            {audioRunning ? <Pause size={15} /> : <Play size={15} />}
+            {audioRunning ? "Пауза" : "Слушать"}
+          </button>
+          <span>{session?.state ?? "idle"}</span>
+        </footer>
+      </main>
+    );
   }
 
   return (

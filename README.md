@@ -19,7 +19,9 @@ npm install
 
 The desktop launcher builds the React frontend when `dist/` is missing, starts
 the Python API on a local random port, and opens the local client in a native
-webview window.
+webview window. It also opens a compact always-on-top overlay for calls. The
+overlay shows the latest detected question, streams the current answer, and can
+pause or resume live audio capture.
 
 ## Realtime Session Core
 

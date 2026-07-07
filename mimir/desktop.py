@@ -8,8 +8,11 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from .audio import LiveAudioConfig
 from .config import app_data_dir
-from .server import HOST, STATIC_ROOT, create_server
+from .credentials import read_secret
+from .hotkeys import WindowsHotkeyController, audio_hotkey, overlay_hotkey
+from .server import HOST, LIVE_AUDIO, STATIC_ROOT, create_server
 
 
 APP_TITLE = "Mimir"
@@ -78,6 +81,46 @@ def smoke_server(url: str) -> None:
         raise RuntimeError(f"Frontend check failed: HTTP {response.status}")
 
 
+class DesktopWindowController:
+    def __init__(self, overlay_window: object) -> None:
+        self.overlay_window = overlay_window
+        self.overlay_visible = True
+        self._lock = threading.Lock()
+        self.hotkeys = WindowsHotkeyController(
+            [
+                overlay_hotkey(self.toggle_overlay),
+                audio_hotkey(self.toggle_audio),
+            ]
+        )
+
+    def start(self) -> None:
+        self.hotkeys.start()
+
+    def stop(self) -> None:
+        self.hotkeys.stop()
+
+    def toggle_overlay(self) -> None:
+        with self._lock:
+            if self.overlay_visible:
+                self.overlay_window.hide()
+                self.overlay_visible = False
+                return
+            self.overlay_window.show()
+            self.overlay_window.on_top = True
+            self.overlay_visible = True
+
+    def toggle_audio(self) -> None:
+        try:
+            snapshot = LIVE_AUDIO.snapshot()
+            if snapshot.get("running"):
+                LIVE_AUDIO.stop()
+                return
+            key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
+            LIVE_AUDIO.start(LiveAudioConfig(), key)
+        except Exception as error:
+            print(f"Audio hotkey failed: {error}", file=sys.stderr)
+
+
 def open_window(url: str, debug: bool) -> None:
     try:
         import webview
@@ -89,7 +132,7 @@ def open_window(url: str, debug: bool) -> None:
     storage_path = app_data_dir() / "webview"
     storage_path.mkdir(parents=True, exist_ok=True)
 
-    webview.create_window(
+    main_window = webview.create_window(
         APP_TITLE,
         url,
         width=1240,
@@ -98,7 +141,31 @@ def open_window(url: str, debug: bool) -> None:
         text_select=True,
         background_color="#0e1116",
     )
-    webview.start(debug=debug, private_mode=False, storage_path=str(storage_path))
+    overlay_window = webview.create_window(
+        "Mimir Overlay",
+        f"{url}/#overlay",
+        width=460,
+        height=360,
+        min_size=(360, 240),
+        frameless=True,
+        easy_drag=True,
+        on_top=True,
+        text_select=True,
+        background_color="#0e1116",
+    )
+    if main_window is None or overlay_window is None:
+        raise RuntimeError("Failed to create desktop windows.")
+
+    controller = DesktopWindowController(overlay_window)
+    try:
+        webview.start(
+            func=controller.start,
+            debug=debug,
+            private_mode=False,
+            storage_path=str(storage_path),
+        )
+    finally:
+        controller.stop()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
