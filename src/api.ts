@@ -141,13 +141,6 @@ export function sendTranscript(source: "remote" | "mic", text: string, isFinal =
   });
 }
 
-export function askManualQuestion(question: string): Promise<QuestionEvent> {
-  return request<QuestionEvent>("/api/manual/question", {
-    method: "POST",
-    body: JSON.stringify({ question })
-  });
-}
-
 export async function uploadSpeechWav(
   source: "remote" | "mic",
   file: File,

@@ -6,7 +6,6 @@ import {
   QuestionEvent,
   SessionSnapshot,
   TranscriptTurn,
-  askManualQuestion,
   getConfig,
   listModels,
   saveConfig,
@@ -40,7 +39,6 @@ export function App() {
   const [answer, setAnswer] = useState("");
   const [source, setSource] = useState<"remote" | "mic">("remote");
   const [utterance, setUtterance] = useState("");
-  const [manualQuestion, setManualQuestion] = useState("");
   const [wavFile, setWavFile] = useState<File | null>(null);
   const [liveRemote, setLiveRemote] = useState(true);
   const [liveMic, setLiveMic] = useState(true);
@@ -81,7 +79,7 @@ export function App() {
       setQuestions((current) => [...current.slice(-9), payload]);
       setCurrentQuestion(payload.question);
       setAnswer("");
-      setStatus(payload.reason === "manual" ? "Manual question sent" : "Question detected");
+      setStatus("Question detected");
     });
 
     events.addEventListener("answer_delta", (event) => {
@@ -258,19 +256,6 @@ export function App() {
       setStatus(source === "remote" ? "Remote turn added" : "Mic turn added");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to add turn");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleManualQuestion() {
-    if (!manualQuestion.trim()) return;
-    setBusy(true);
-    try {
-      await askManualQuestion(manualQuestion.trim());
-      setManualQuestion("");
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Failed to ask question");
     } finally {
       setBusy(false);
     }
@@ -468,17 +453,6 @@ export function App() {
             <Bot size={18} />
             <h2>Answer Stream</h2>
           </div>
-          <div className="manual-row">
-            <input
-              value={manualQuestion}
-              onChange={(event) => setManualQuestion(event.target.value)}
-              placeholder="Manual question override..."
-            />
-            <button className="primary" onClick={handleManualQuestion} disabled={busy || !manualQuestion.trim()}>
-              <Send size={16} />
-              Ask
-            </button>
-          </div>
           <article className="question-card">
             <small>Current question</small>
             <p>{currentQuestion || "No active question."}</p>
@@ -486,10 +460,10 @@ export function App() {
           <article className="answer">{answer || "Streaming answer will appear here."}</article>
           <div className="questions">
             {questions.map((item) => (
-              <button key={item.questionId} onClick={() => setManualQuestion(item.question)}>
+              <div className="question-item" key={item.questionId}>
                 <span>{item.question}</span>
                 <small>{Math.round(item.confidence * 100)}%</small>
-              </button>
+              </div>
             ))}
           </div>
         </div>

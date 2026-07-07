@@ -324,16 +324,11 @@ textarea {
   line-height: 1.5;
 }
 
-.input-row,
-.manual-row {
+.input-row {
   display: grid;
   grid-template-columns: minmax(130px, 180px) auto;
   gap: 10px;
   margin-bottom: 12px;
-}
-
-.manual-row {
-  grid-template-columns: 1fr auto;
 }
 
 .wav-row {
@@ -397,11 +392,15 @@ textarea {
   margin-top: 12px;
 }
 
-.questions button {
+.question-item {
   display: flex;
   justify-content: space-between;
   gap: 12px;
   text-align: left;
+  border: 1px solid #293241;
+  background: #0f141b;
+  border-radius: 8px;
+  padding: 10px 11px;
 }
 
 .questions small {

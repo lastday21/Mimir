@@ -23,10 +23,13 @@ webview window. It also opens a compact always-on-top overlay for calls. The
 overlay shows the latest detected question, streams the current answer, and can
 pause or resume live audio capture.
 
+Desktop hotkeys are `Ctrl+M` for showing or hiding the overlay and `Ctrl+Space`
+for pausing or resuming live audio capture.
+
 ## Realtime Session Core
 
-The main path is no longer a manual record/detect/ask flow. The backend exposes
-a session API:
+The main path is live speech detection followed by automatic answer streaming.
+The backend exposes a session API:
 
 - `POST /api/session/start`
 - `POST /api/session/stop`
@@ -36,7 +39,6 @@ a session API:
 - `POST /api/session/audio/stop`
 - `POST /api/session/transcript`
 - `POST /api/session/stt/wav`
-- `POST /api/manual/question`
 
 `/api/session/audio/start` starts independent live capture sources for remote
 loopback and mic audio. Both sources pass through a lightweight energy VAD,

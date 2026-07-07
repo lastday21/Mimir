@@ -8,12 +8,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 
-MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 VK_M = 0x4D
-VK_P = 0x50
+VK_SPACE = 0x20
 
 
 @dataclass(frozen=True)
@@ -73,8 +72,8 @@ class WindowsHotkeyController:
 
 
 def overlay_hotkey(callback: Callable[[], None]) -> HotkeySpec:
-    return HotkeySpec(1, MOD_CONTROL | MOD_ALT, VK_M, callback)
+    return HotkeySpec(1, MOD_CONTROL, VK_M, callback)
 
 
 def audio_hotkey(callback: Callable[[], None]) -> HotkeySpec:
-    return HotkeySpec(2, MOD_CONTROL | MOD_ALT, VK_P, callback)
+    return HotkeySpec(2, MOD_CONTROL, VK_SPACE, callback)

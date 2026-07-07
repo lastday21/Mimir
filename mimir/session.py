@@ -80,12 +80,6 @@ class SessionManager:
             self._maybe_trigger_question(turn.text, turn.timestamp_ms)
         return payload
 
-    def manual_question(self, question: str) -> dict[str, Any]:
-        text = question.strip()
-        if not text:
-            raise ValueError("question is required")
-        return self.trigger_question(text, confidence=1.0, reason="manual")
-
     def publish_status(self, event: str, payload: dict[str, Any]) -> None:
         self._publish(event, payload)
 

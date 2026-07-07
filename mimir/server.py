@@ -72,8 +72,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.handle_session_transcript()
             elif parsed.path == "/api/session/stt/wav":
                 self.handle_session_stt_wav(parsed.query)
-            elif parsed.path == "/api/manual/question":
-                self.handle_manual_question()
             else:
                 self.send_error(404)
         except ProviderError as error:
@@ -153,11 +151,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         text = str(payload.get("text") or "")
         is_final = bool(payload.get("isFinal", True))
         self.send_json(SESSION_MANAGER.ingest_transcript(source, text, is_final=is_final))
-
-    def handle_manual_question(self) -> None:
-        payload = self.read_json()
-        question = str(payload.get("question") or "").strip()
-        self.send_json(SESSION_MANAGER.manual_question(question))
 
     def handle_session_stt_wav(self, query: str) -> None:
         params = parse_qs(query)
