@@ -11,7 +11,9 @@ import {
   listModels,
   saveConfig,
   sendTranscript,
+  startLiveAudio,
   startSession,
+  stopLiveAudio,
   stopSession,
   storeYandexKey,
   uploadSpeechWav
@@ -38,6 +40,9 @@ export function App() {
   const [utterance, setUtterance] = useState("");
   const [manualQuestion, setManualQuestion] = useState("");
   const [wavFile, setWavFile] = useState<File | null>(null);
+  const [liveRemote, setLiveRemote] = useState(true);
+  const [liveMic, setLiveMic] = useState(true);
+  const [audioRunning, setAudioRunning] = useState(false);
   const [status, setStatus] = useState("Start the Python API with python -m mimir");
   const [busy, setBusy] = useState(false);
 
@@ -97,6 +102,22 @@ export function App() {
 
     events.addEventListener("stt_error", (event) => {
       const payload = parseEvent<{ error: string }>(event);
+      setStatus(payload.error);
+    });
+
+    events.addEventListener("audio_status", (event) => {
+      const payload = parseEvent<{ status: string; source?: string; running?: boolean }>(event);
+      if (typeof payload.running === "boolean") {
+        setAudioRunning(payload.running);
+      }
+      setStatus(payload.source ? `Audio ${payload.source} ${payload.status}` : `Audio ${payload.status}`);
+    });
+
+    events.addEventListener("audio_error", (event) => {
+      const payload = parseEvent<{ error: string; running?: boolean }>(event);
+      if (typeof payload.running === "boolean") {
+        setAudioRunning(payload.running);
+      }
       setStatus(payload.error);
     });
 
@@ -174,9 +195,40 @@ export function App() {
     try {
       const snapshot = await stopSession();
       setSession(snapshot);
+      setAudioRunning(false);
       setStatus("Session stopped");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to stop session");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleStartLiveAudio() {
+    const sources: Array<"remote" | "mic"> = [];
+    if (liveRemote) sources.push("remote");
+    if (liveMic) sources.push("mic");
+    if (sources.length === 0) return;
+    setBusy(true);
+    try {
+      const snapshot = await startLiveAudio(sources);
+      setAudioRunning(snapshot.running);
+      setStatus(`Audio streaming: ${snapshot.sources.join(" + ")}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to start audio");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleStopLiveAudio() {
+    setBusy(true);
+    try {
+      const snapshot = await stopLiveAudio();
+      setAudioRunning(snapshot.running);
+      setStatus("Audio stopped");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to stop audio");
     } finally {
       setBusy(false);
     }
@@ -303,6 +355,24 @@ export function App() {
           </button>
           <span className="session-state">{session?.state ?? "idle"}</span>
           <span className="session-id">{session?.sessionId ?? "no session"}</span>
+        </div>
+        <div className="audio-row">
+          <label className="check-row">
+            <input type="checkbox" checked={liveRemote} onChange={(event) => setLiveRemote(event.target.checked)} />
+            Remote loopback
+          </label>
+          <label className="check-row">
+            <input type="checkbox" checked={liveMic} onChange={(event) => setLiveMic(event.target.checked)} />
+            Mic
+          </label>
+          <button className="primary" onClick={handleStartLiveAudio} disabled={busy || audioRunning || (!liveRemote && !liveMic)}>
+            <Play size={16} />
+            Start audio
+          </button>
+          <button className="danger" onClick={handleStopLiveAudio} disabled={busy || !audioRunning}>
+            <Square size={16} />
+            Stop audio
+          </button>
         </div>
       </section>
 

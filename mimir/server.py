@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .audio import AudioCaptureError, LiveAudioConfig, LiveAudioController, list_audio_devices
 from .config import AppConfig, load_config, save_config
 from .credentials import read_secret, write_secret
 from .models import ModelInfo
@@ -23,6 +24,7 @@ PORT = 8765
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "dist"
 ALLOWED_CORS_HEADERS = "Content-Type"
 SESSION_MANAGER = SessionManager()
+LIVE_AUDIO = LiveAudioController(SESSION_MANAGER, YandexSpeechKitClient)
 MAX_DEV_WAV_BYTES = 25_000_000
 
 
@@ -39,6 +41,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/models":
             self.handle_models()
+            return
+        if parsed.path == "/api/audio/devices":
+            self.handle_audio_devices()
             return
         if parsed.path == "/api/metrics/current":
             self.send_json(SESSION_MANAGER.metrics())
@@ -58,7 +63,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/session/start":
                 self.send_json(SESSION_MANAGER.start())
             elif parsed.path == "/api/session/stop":
-                self.send_json(SESSION_MANAGER.stop())
+                self.handle_session_stop()
+            elif parsed.path == "/api/session/audio/start":
+                self.handle_live_audio_start()
+            elif parsed.path == "/api/session/audio/stop":
+                self.send_json(LIVE_AUDIO.stop())
             elif parsed.path == "/api/session/transcript":
                 self.handle_session_transcript()
             elif parsed.path == "/api/session/stt/wav":
@@ -68,6 +77,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
         except ProviderError as error:
+            self.send_json({"error": str(error)}, status=502)
+        except AudioCaptureError as error:
             self.send_json({"error": str(error)}, status=502)
         except ValueError as error:
             self.send_json({"error": str(error)}, status=400)
@@ -103,6 +114,38 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "preferredModel": preferred.id if preferred else None,
             }
         )
+
+    def handle_audio_devices(self) -> None:
+        try:
+            devices = list_audio_devices()
+            self.send_json({"available": True, "devices": devices})
+        except AudioCaptureError as error:
+            self.send_json({"available": False, "devices": [], "error": str(error)})
+
+    def handle_session_stop(self) -> None:
+        LIVE_AUDIO.stop()
+        self.send_json(SESSION_MANAGER.stop())
+
+    def handle_live_audio_start(self) -> None:
+        payload = self.read_json()
+        sources = payload.get("sources") or ["remote", "mic"]
+        if isinstance(sources, str):
+            sources = [sources]
+        if not isinstance(sources, list):
+            raise ValueError("sources must be a list")
+        device_ids = payload.get("deviceIds") or {}
+        if not isinstance(device_ids, dict):
+            raise ValueError("deviceIds must be an object")
+        live_config = LiveAudioConfig(
+            sources=tuple(str(source) for source in sources),
+            language=str(payload.get("language") or "ru-RU"),
+            sample_rate_hertz=int(payload.get("sampleRateHertz") or 16_000),
+            chunk_duration_ms=int(payload.get("chunkDurationMs") or 200),
+            vad_enabled=bool(payload.get("vadEnabled", True)),
+            device_ids={str(key): str(value) for key, value in device_ids.items()},
+        )
+        key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
+        self.send_json(LIVE_AUDIO.start(live_config, key))
 
     def handle_session_transcript(self) -> None:
         payload = self.read_json()

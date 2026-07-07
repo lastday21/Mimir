@@ -29,14 +29,20 @@ a session API:
 - `POST /api/session/start`
 - `POST /api/session/stop`
 - `GET /api/session/events`
+- `GET /api/audio/devices`
+- `POST /api/session/audio/start`
+- `POST /api/session/audio/stop`
 - `POST /api/session/transcript`
 - `POST /api/session/stt/wav`
 - `POST /api/manual/question`
 
-`/api/session/transcript` is a development input until the continuous Python
-audio capture path is wired in. It already feeds the same dialogue memory,
-question trigger, context builder, and streaming LLM path that live audio will
-use.
+`/api/session/audio/start` starts independent live capture sources for remote
+loopback and mic audio. Both sources pass through a lightweight energy VAD,
+SpeechKit streaming, the shared transcript bus, dialogue memory, question
+trigger, context builder, and streaming LLM path.
+
+`/api/session/transcript` remains a development input for direct transcript
+injection.
 
 SpeechKit streaming uses direct SpeechKit v3 gRPC through the generated stubs
 from the `yandexcloud` package.
@@ -75,7 +81,7 @@ Open `http://127.0.0.1:8765`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.check
-npm run build
+npm run smoke
 .\.venv\Scripts\python.exe -m mimir.desktop --check
 ```
 

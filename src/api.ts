@@ -45,6 +45,29 @@ export interface QuestionEvent {
   };
 }
 
+export interface AudioDevice {
+  id: string;
+  name: string;
+  source: "remote" | "mic";
+  loopback: boolean;
+  default: boolean;
+}
+
+export interface AudioDevicesPayload {
+  available: boolean;
+  devices: AudioDevice[];
+  error?: string;
+}
+
+export interface LiveAudioSnapshot {
+  running: boolean;
+  sources: Array<"remote" | "mic">;
+  language: string;
+  sampleRateHertz: number;
+  chunkDurationMs: number;
+  vadEnabled: boolean;
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...options,
@@ -82,6 +105,10 @@ export function listModels(): Promise<{ models: ModelInfo[]; preferredModel: str
   return request<{ models: ModelInfo[]; preferredModel: string | null }>("/api/models");
 }
 
+export function listAudioDevices(): Promise<AudioDevicesPayload> {
+  return request<AudioDevicesPayload>("/api/audio/devices");
+}
+
 export function startSession(): Promise<SessionSnapshot> {
   return request<SessionSnapshot>("/api/session/start", {
     method: "POST"
@@ -90,6 +117,19 @@ export function startSession(): Promise<SessionSnapshot> {
 
 export function stopSession(): Promise<SessionSnapshot> {
   return request<SessionSnapshot>("/api/session/stop", {
+    method: "POST"
+  });
+}
+
+export function startLiveAudio(sources: Array<"remote" | "mic">): Promise<LiveAudioSnapshot> {
+  return request<LiveAudioSnapshot>("/api/session/audio/start", {
+    method: "POST",
+    body: JSON.stringify({ sources, language: "ru-RU", vadEnabled: true })
+  });
+}
+
+export function stopLiveAudio(): Promise<LiveAudioSnapshot> {
+  return request<LiveAudioSnapshot>("/api/session/audio/stop", {
     method: "POST"
   });
 }

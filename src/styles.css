@@ -185,6 +185,32 @@ button:disabled {
   gap: 10px;
 }
 
+.audio-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(90px, 140px) auto auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.check-row {
+  min-height: 39px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid #293241;
+  background: #0f141b;
+  color: #a8b3c1;
+  border-radius: 7px;
+  padding: 0 11px;
+  font-size: 13px;
+}
+
+.check-row input {
+  width: auto;
+}
+
 .session-state,
 .session-id {
   min-height: 39px;
