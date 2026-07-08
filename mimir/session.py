@@ -11,6 +11,7 @@ from typing import Any
 from .config import load_config
 from .credentials import read_secret
 from .dialogue import MIC_SOURCE, REMOTE_SOURCE, DialogueMemory, DialogueTurn
+from .live_trace import trace_live_event
 from .models import ChatMessage
 from .prompts import build_realtime_messages
 from .providers import OllamaClient, YandexAIStudioClient
@@ -49,6 +50,7 @@ class SessionManager:
             self._state = "listening"
             payload = self.snapshot_locked()
             self.publish_locked("session_state", payload)
+            trace_live_event("session.start", sessionId=self._session_id, state=self._state)
             return payload
 
     def stop(self) -> dict[str, Any]:
@@ -57,6 +59,7 @@ class SessionManager:
             self._state = "stopped"
             payload = self.snapshot_locked()
             self.publish_locked("session_state", payload)
+            trace_live_event("session.stop", sessionId=self._session_id, state=self._state)
             return payload
 
     def ingest_transcript(
@@ -81,6 +84,14 @@ class SessionManager:
                 "timestampMs": turn.timestamp_ms,
             }
             self.publish_locked("transcript", payload)
+            trace_live_event(
+                "session.transcript",
+                source=turn.source,
+                text=turn.text,
+                isFinal=turn.is_final,
+                detectQuestion=detect_question,
+                timestampMs=turn.timestamp_ms,
+            )
 
         if detect_question and turn.source == REMOTE_SOURCE and turn.is_final:
             self._maybe_trigger_question(turn.text, turn.timestamp_ms)
@@ -149,6 +160,13 @@ class SessionManager:
                 },
             }
             self.publish_locked("question", payload)
+            trace_live_event(
+                "session.question",
+                questionId=question_id,
+                question=question,
+                confidence=confidence,
+                reason=reason,
+            )
             self._cancel_answer.set()
             self._cancel_answer = threading.Event()
             cancel = self._cancel_answer

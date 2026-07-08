@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from ..dialogue import MIC_SOURCE, REMOTE_SOURCE
+from ..live_trace import trace_live_event, trace_path_payload
 from ..providers import YandexRealtimeClient, YandexRealtimeConfig
 from ..providers.base import ProviderError
 from ..providers.yandex_realtime import RealtimeClientProtocol
@@ -113,6 +114,16 @@ class RealtimeAudioController:
             stop_event = self._stop_event
 
         self.session.start()
+        trace_live_event(
+            "audio.start",
+            mode="yandex_realtime",
+            sources=list(sources),
+            language=self._config.language,
+            sampleRateHertz=self._config.sample_rate_hertz,
+            chunkDurationMs=self._config.chunk_duration_ms,
+            vadEnabled=self._config.vad_enabled,
+            deviceIds=self._config.device_ids,
+        )
         self.publish(
             "audio_status",
             {
@@ -141,6 +152,7 @@ class RealtimeAudioController:
         if not was_running:
             return self.snapshot()
 
+        trace_live_event("audio.stop", mode="yandex_realtime")
         self.publish("audio_status", {"status": "stopping", "mode": "yandex_realtime", "running": False})
         if stop_event is not None:
             stop_event.set()
@@ -168,6 +180,7 @@ class RealtimeAudioController:
             "chunkDurationMs": config.chunk_duration_ms if config else 200,
             "vadEnabled": config.vad_enabled if config else True,
             "deviceIds": dict(config.device_ids) if config else {},
+            "tracePath": trace_path_payload(),
         }
 
     def _run(self, api_key: str, folder_id: str, stop_event: threading.Event | None) -> None:
@@ -201,10 +214,15 @@ class RealtimeAudioController:
             sender = asyncio.create_task(self._send_events(client, queue, stop_event))
             receiver = asyncio.create_task(self._receive_events(client, stop_event))
             try:
+                drained_at: float | None = None
                 while not stop_event.is_set():
-                    if not any(thread.is_alive() for thread in producers) and queue.empty():
+                    if any(thread.is_alive() for thread in producers) or not queue.empty():
+                        drained_at = None
+                    elif drained_at is None:
+                        drained_at = time.monotonic()
+                    elif time.monotonic() - drained_at >= 0.2:
                         break
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.05)
             finally:
                 stop_event.set()
                 sender.cancel()
@@ -257,6 +275,7 @@ class RealtimeAudioController:
             for chunk in self._vad_chunks(REMOTE_SOURCE, source.chunks(stop_event), config, stop_event):
                 if stop_event.is_set():
                     return
+                trace_live_event("audio.remote.enqueue", bytes=len(chunk))
                 self._put(loop, queue, ("remote_audio", REMOTE_SOURCE, chunk))
         except Exception as error:
             self.publish(
@@ -289,6 +308,7 @@ class RealtimeAudioController:
                     return
                 self.session.ingest_transcript(MIC_SOURCE, event.text, is_final=event.is_final, detect_question=False)
                 if event.is_final and event.text.strip():
+                    trace_live_event("audio.mic.context.enqueue", text=event.text)
                     self._put(loop, queue, ("mic_context", MIC_SOURCE, event.text))
         except Exception as error:
             self.publish(
@@ -310,8 +330,10 @@ class RealtimeAudioController:
             except asyncio.TimeoutError:
                 continue
             if kind == "remote_audio" and isinstance(payload, bytes):
+                trace_live_event("realtime.remote.send", bytes=len(payload))
                 await client.append_audio(payload)
             elif kind == "mic_context" and isinstance(payload, str):
+                trace_live_event("realtime.mic_context.send", text=payload)
                 await client.add_mic_context(payload)
 
     async def _receive_events(self, client: RealtimeClientProtocol, stop_event: threading.Event) -> None:
@@ -324,6 +346,7 @@ class RealtimeAudioController:
             if event_type == "conversation.item.input_audio_transcription.completed":
                 text = str(message.get("transcript") or "").strip()
                 if text:
+                    trace_live_event("realtime.remote.transcript", text=text)
                     last_remote_text = text
                     self.session.ingest_transcript(REMOTE_SOURCE, text, is_final=True, detect_question=False)
             elif event_type == "conversation.item.input_audio_transcription.delta":
@@ -338,6 +361,7 @@ class RealtimeAudioController:
                 delta = str(message.get("delta") or "")
                 if not delta:
                     continue
+                trace_live_event("realtime.answer.delta", delta=delta)
                 if not current_question_id:
                     current_question_id = self._publish_realtime_question(last_remote_text)
                 self.publish(
@@ -351,11 +375,13 @@ class RealtimeAudioController:
                 )
             elif event_type == "response.output_text.done":
                 if current_question_id:
+                    trace_live_event("realtime.answer.done", questionId=current_question_id)
                     self.publish("answer_done", {"questionId": current_question_id, "latencyMs": 0})
                     current_question_id = ""
             elif event_type == "error":
                 error = message.get("error") or {}
                 text = str(error.get("message") if isinstance(error, dict) else error)
+                trace_live_event("realtime.error", error=text)
                 self.publish("audio_error", {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "error": text, "running": True})
 
     def _publish_realtime_question(self, text: str) -> str:
@@ -420,14 +446,8 @@ class RealtimeAudioController:
                 yield chunk
 
     def _finish_source(self, source: str) -> None:
-        should_publish_idle = False
         with self._lock:
             self._active_sources.discard(source)
-            if not self._active_sources and self._running:
-                self._running = False
-                should_publish_idle = True
-        if should_publish_idle:
-            self.publish("audio_status", {"status": "idle", "mode": "yandex_realtime", "running": False})
 
     def _put(
         self,

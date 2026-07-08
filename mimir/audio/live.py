@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from ..dialogue import MIC_SOURCE, REMOTE_SOURCE
+from ..live_trace import trace_live_event, trace_path_payload
 from ..providers.base import ProviderError
 from ..stt import AudioStreamConfig, SpeechKitStreamRunner, StreamingRecognizer
 from .capture import AudioCaptureConfig, SoundcardPcmSource
@@ -87,6 +88,16 @@ class LiveAudioController:
             self._running = True
 
         self.session.start()
+        trace_live_event(
+            "audio.start",
+            mode="speechkit",
+            sources=list(sources),
+            language=self._config.language,
+            sampleRateHertz=self._config.sample_rate_hertz,
+            chunkDurationMs=self._config.chunk_duration_ms,
+            vadEnabled=self._config.vad_enabled,
+            deviceIds=self._config.device_ids,
+        )
         self.publish(
             "audio_status",
             {
@@ -119,6 +130,7 @@ class LiveAudioController:
         if not was_running:
             return self.snapshot()
 
+        trace_live_event("audio.stop", mode="speechkit")
         self.publish("audio_status", {"status": "stopping", "running": False})
         if stop_event is not None:
             stop_event.set()
@@ -148,6 +160,7 @@ class LiveAudioController:
             "chunkDurationMs": config.chunk_duration_ms if config else 200,
             "vadEnabled": config.vad_enabled if config else True,
             "deviceIds": dict(config.device_ids) if config else {},
+            "tracePath": trace_path_payload(),
         }
 
     def _run_source(self, source: str, api_key: str) -> None:
@@ -183,6 +196,13 @@ class LiveAudioController:
             for event in runner.run(source, chunks):
                 if stop_event.is_set():
                     break
+                trace_live_event(
+                    "speechkit.transcript",
+                    source=event.source,
+                    text=event.text,
+                    isFinal=event.is_final,
+                    endOfUtterance=event.end_of_utterance,
+                )
                 self.session.ingest_transcript(event.source, event.text, is_final=event.is_final)
             self.publish("audio_status", {"source": source, "status": "done"})
         except Exception as error:

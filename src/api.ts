@@ -70,6 +70,7 @@ export interface LiveAudioSnapshot {
   chunkDurationMs: number;
   vadEnabled: boolean;
   deviceIds?: Partial<Record<"remote" | "mic", string>>;
+  tracePath?: string;
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {

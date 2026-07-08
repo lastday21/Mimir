@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol, Self
 
+from ..live_trace import trace_live_event
 from .base import ProviderError
 
 
@@ -63,6 +64,7 @@ class YandexRealtimeClient:
             raise ProviderError("Yandex Realtime API requires `aiohttp`. Reinstall with `pip install -e .`.") from error
 
         self._session = aiohttp.ClientSession()
+        trace_live_event("realtime.connect", model=self.config.model, folderId=self.config.folder_id)
         self._ws = await self._session.ws_connect(
             self.config.url,
             headers={"Authorization": f"Api-Key {self.config.api_key}"},
@@ -71,6 +73,7 @@ class YandexRealtimeClient:
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        trace_live_event("realtime.disconnect", excType=str(exc_type) if exc_type else "")
         if self._ws is not None:
             await self._ws.close()
             self._ws = None
@@ -79,6 +82,14 @@ class YandexRealtimeClient:
             self._session = None
 
     async def setup_session(self, instructions: str, sample_rate_hertz: int) -> None:
+        trace_live_event(
+            "realtime.session.update",
+            model=self.config.model,
+            sampleRateHertz=sample_rate_hertz,
+            outputModalities=["text"],
+            turnDetection={"type": "server_vad", "threshold": 0.5, "silence_duration_ms": 400},
+            instructions=instructions,
+        )
         await self._send(
             {
                 "type": "session.update",
@@ -105,6 +116,7 @@ class YandexRealtimeClient:
     async def append_audio(self, pcm: bytes) -> None:
         if not pcm:
             return
+        trace_live_event("realtime.out.input_audio_buffer.append", bytes=len(pcm))
         await self._send(
             {
                 "type": "input_audio_buffer.append",
@@ -116,6 +128,7 @@ class YandexRealtimeClient:
         normalized = text.strip()
         if not normalized:
             return
+        trace_live_event("realtime.out.conversation.item.create", source="mic", text=normalized)
         await self._send(
             {
                 "type": "conversation.item.create",
@@ -145,8 +158,11 @@ class YandexRealtimeClient:
         ws = self._require_ws()
         async for message in ws:
             if message.type == aiohttp.WSMsgType.TEXT:
-                yield json.loads(message.data)
+                payload = json.loads(message.data)
+                trace_live_event("realtime.in.event", **trace_realtime_payload(payload))
+                yield payload
             elif message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                trace_live_event("realtime.closed", messageType=str(message.type))
                 return
 
     async def _send(self, payload: dict[str, Any]) -> None:
@@ -156,3 +172,14 @@ class YandexRealtimeClient:
         if self._ws is None:
             raise ProviderError("Yandex Realtime websocket is not connected")
         return self._ws
+
+
+def trace_realtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(payload.get("type") or "")
+    item: dict[str, Any] = {"type": event_type}
+    for key in ("transcript", "delta"):
+        if key in payload:
+            item[key] = payload[key]
+    if event_type == "error":
+        item["error"] = payload.get("error")
+    return item

@@ -54,6 +54,12 @@ SpeechKit streaming uses direct SpeechKit v3 gRPC through the generated stubs
 from the `yandexcloud` package. Realtime mode uses `aiohttp` WebSocket transport
 with the `speech-realtime-250923` model.
 
+Live audio writes a local JSONL trace to `.work/live-traces/`. The trace records
+session state, transcripts, mic context, outgoing Realtime audio chunk sizes,
+incoming Realtime events, answer deltas, and errors. It does not store API keys
+or raw audio bytes. Set `MIMIR_LIVE_TRACE=0` to disable it or
+`MIMIR_LIVE_TRACE_DIR=<path>` to write traces elsewhere.
+
 `POST /api/session/stt/wav` accepts a mono 16-bit PCM WAV file as a development
 feeder. It streams recognition results into the same session memory and question
 trigger path that live mic/loopback capture will use.
