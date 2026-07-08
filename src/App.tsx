@@ -2,11 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import { Bot, Check, Cloud, KeyRound, Loader2, MessageSquare, Pause, Play, Send, Server, Square, Zap } from "lucide-react";
 import {
   AppConfig,
+  AudioDevice,
   ModelInfo,
   QuestionEvent,
   SessionSnapshot,
   TranscriptTurn,
   getConfig,
+  listAudioDevices,
   listModels,
   saveConfig,
   sendTranscript,
@@ -27,6 +29,13 @@ const DEFAULT_CONFIG: AppConfig = {
 };
 
 const IS_OVERLAY = window.location.hash === "#overlay";
+type AudioSource = "remote" | "mic";
+
+interface AudioLevel {
+  rms: number;
+  level: number;
+  speech: boolean;
+}
 
 export function App() {
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
@@ -37,9 +46,11 @@ export function App() {
   const [questions, setQuestions] = useState<QuestionEvent[]>([]);
   const [currentQuestion, setCurrentQuestion] = useState("");
   const [answer, setAnswer] = useState("");
-  const [source, setSource] = useState<"remote" | "mic">("remote");
+  const [source, setSource] = useState<AudioSource>("remote");
   const [utterance, setUtterance] = useState("");
   const [wavFile, setWavFile] = useState<File | null>(null);
+  const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
+  const [audioLevels, setAudioLevels] = useState<Record<AudioSource, AudioLevel>>(emptyAudioLevels());
   const [liveRemote, setLiveRemote] = useState(true);
   const [liveMic, setLiveMic] = useState(true);
   const [audioRunning, setAudioRunning] = useState(false);
@@ -56,6 +67,21 @@ export function App() {
       .then((loaded) => {
         setConfig(loaded);
         setStatus("Python API connected");
+      })
+      .catch((error) => setStatus(error.message));
+  }, []);
+
+  useEffect(() => {
+    listAudioDevices()
+      .then((payload) => {
+        if (payload.available) {
+          setAudioDevices(payload.devices);
+          return;
+        }
+        setAudioDevices([]);
+        if (payload.error) {
+          setStatus(payload.error);
+        }
       })
       .catch((error) => setStatus(error.message));
   }, []);
@@ -114,14 +140,33 @@ export function App() {
       const payload = parseEvent<{ status: string; source?: string; running?: boolean }>(event);
       if (typeof payload.running === "boolean") {
         setAudioRunning(payload.running);
+        if (!payload.running) {
+          setAudioLevels(emptyAudioLevels());
+        }
       }
       setStatus(payload.source ? `Audio ${payload.source} ${payload.status}` : `Audio ${payload.status}`);
+    });
+
+    events.addEventListener("audio_level", (event) => {
+      const payload = parseEvent<{ source: AudioSource; rms: number; speech: boolean }>(event);
+      if (!isAudioSource(payload.source)) return;
+      setAudioLevels((current) => ({
+        ...current,
+        [payload.source]: {
+          rms: payload.rms,
+          level: rmsToLevel(payload.rms),
+          speech: payload.speech
+        }
+      }));
     });
 
     events.addEventListener("audio_error", (event) => {
       const payload = parseEvent<{ error: string; running?: boolean }>(event);
       if (typeof payload.running === "boolean") {
         setAudioRunning(payload.running);
+        if (!payload.running) {
+          setAudioLevels(emptyAudioLevels());
+        }
       }
       setStatus(payload.error);
     });
@@ -210,13 +255,14 @@ export function App() {
   }
 
   async function handleStartLiveAudio() {
-    const sources: Array<"remote" | "mic"> = [];
+    const sources: AudioSource[] = [];
     if (liveRemote) sources.push("remote");
     if (liveMic) sources.push("mic");
     if (sources.length === 0) return;
     setBusy(true);
     try {
-      const snapshot = await startLiveAudio(sources);
+      setAudioLevels(emptyAudioLevels());
+      const snapshot = await startLiveAudio(sources, recommendedDeviceIds(audioDevices, sources));
       setAudioRunning(snapshot.running);
       setStatus(`Audio streaming: ${snapshot.sources.join(" + ")}`);
     } catch (error) {
@@ -231,6 +277,7 @@ export function App() {
     try {
       const snapshot = await stopLiveAudio();
       setAudioRunning(snapshot.running);
+      setAudioLevels(emptyAudioLevels());
       setStatus("Audio stopped");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to stop audio");
@@ -292,6 +339,11 @@ export function App() {
         <section className="overlay-answer">
           {answer || "Ответ появится здесь автоматически."}
         </section>
+
+        <div className="overlay-levels">
+          <AudioMeter compact label="Meet" deviceName={deviceLabel(audioDevices, "remote")} level={audioLevels.remote} />
+          <AudioMeter compact label="Mic" deviceName={deviceLabel(audioDevices, "mic")} level={audioLevels.mic} />
+        </div>
 
         <footer className="overlay-actions">
           <button onClick={handleToggleLiveAudio} disabled={busy}>
@@ -388,7 +440,7 @@ export function App() {
         <div className="audio-row">
           <label className="check-row">
             <input type="checkbox" checked={liveRemote} onChange={(event) => setLiveRemote(event.target.checked)} />
-            Remote loopback
+            Meet audio
           </label>
           <label className="check-row">
             <input type="checkbox" checked={liveMic} onChange={(event) => setLiveMic(event.target.checked)} />
@@ -403,6 +455,10 @@ export function App() {
             Stop audio
           </button>
         </div>
+        <div className="audio-meter-grid">
+          <AudioMeter label="Meet audio" deviceName={deviceLabel(audioDevices, "remote")} level={audioLevels.remote} />
+          <AudioMeter label="Mic" deviceName={deviceLabel(audioDevices, "mic")} level={audioLevels.mic} />
+        </div>
       </section>
 
       <section className="workspace">
@@ -412,7 +468,7 @@ export function App() {
             <h2>Transcript Bus</h2>
           </div>
           <div className="input-row">
-            <select value={source} onChange={(event) => setSource(event.target.value as "remote" | "mic")}>
+            <select value={source} onChange={(event) => setSource(event.target.value as AudioSource)}>
               <option value="remote">Remote</option>
               <option value="mic">Mic</option>
             </select>
@@ -474,4 +530,70 @@ export function App() {
 
 function parseEvent<T>(event: Event): T {
   return JSON.parse((event as MessageEvent<string>).data) as T;
+}
+
+function AudioMeter({
+  compact = false,
+  deviceName,
+  label,
+  level
+}: {
+  compact?: boolean;
+  deviceName: string;
+  label: string;
+  level: AudioLevel;
+}) {
+  const percent = Math.round(level.level * 100);
+  return (
+    <div className={`audio-meter ${compact ? "compact" : ""} ${level.speech ? "speech" : ""}`}>
+      <div className="audio-meter-head">
+        <strong>{label}</strong>
+        <span>{deviceName}</span>
+      </div>
+      <div className="audio-meter-track">
+        <div className="audio-meter-fill" style={{ width: `${percent}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function recommendedDeviceIds(
+  devices: AudioDevice[],
+  sources: AudioSource[]
+): Partial<Record<AudioSource, string>> {
+  const ids: Partial<Record<AudioSource, string>> = {};
+  for (const source of sources) {
+    const device = preferredAudioDevice(devices, source);
+    if (device) {
+      ids[source] = device.id;
+    }
+  }
+  return ids;
+}
+
+function deviceLabel(devices: AudioDevice[], source: AudioSource): string {
+  return preferredAudioDevice(devices, source)?.name ?? (source === "remote" ? "Auto Meet output" : "Auto headset mic");
+}
+
+function preferredAudioDevice(devices: AudioDevice[], source: AudioSource): AudioDevice | undefined {
+  return (
+    devices.find((device) => device.source === source && device.recommended) ??
+    devices.find((device) => device.source === source && device.default) ??
+    devices.find((device) => device.source === source)
+  );
+}
+
+function emptyAudioLevels(): Record<AudioSource, AudioLevel> {
+  return {
+    remote: { rms: 0, level: 0, speech: false },
+    mic: { rms: 0, level: 0, speech: false }
+  };
+}
+
+function rmsToLevel(rms: number): number {
+  return Math.max(0, Math.min(1, rms / 5000));
+}
+
+function isAudioSource(source: string): source is AudioSource {
+  return source === "remote" || source === "mic";
 }

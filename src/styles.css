@@ -36,7 +36,7 @@ main {
   width: 100vw;
   height: 100vh;
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto auto;
   gap: 10px;
   margin: 0;
   padding: 12px;
@@ -112,6 +112,12 @@ main {
 .overlay-actions button {
   min-height: 34px;
   padding: 7px 10px;
+}
+
+.overlay-levels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
 }
 
 .app-header {
@@ -279,6 +285,68 @@ button:disabled {
   align-items: center;
   gap: 10px;
   margin-top: 12px;
+}
+
+.audio-meter-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.audio-meter {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid #293241;
+  background: #0f141b;
+  border-radius: 8px;
+  padding: 10px 11px;
+}
+
+.audio-meter.compact {
+  gap: 6px;
+  padding: 8px;
+}
+
+.audio-meter-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.audio-meter-head strong {
+  color: #d7e0ea;
+}
+
+.audio-meter-head span {
+  min-width: 0;
+  overflow: hidden;
+  color: #8ea0b5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audio-meter-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #202837;
+}
+
+.audio-meter-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: #5ba4ff;
+  transition: width 120ms ease;
+}
+
+.audio-meter.speech .audio-meter-fill {
+  background: #3fb950;
 }
 
 .check-row {

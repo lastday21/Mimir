@@ -12,6 +12,54 @@ class AudioCaptureError(RuntimeError):
     pass
 
 
+HEADSET_MIC_KEYWORDS = (
+    "headset",
+    "headphone",
+    "headphones",
+    "hands-free",
+    "handsfree",
+    "earbuds",
+    "earphone",
+    "airpods",
+    "buds",
+    "bluetooth",
+    "wireless",
+    "jabra",
+    "sony",
+    "bose",
+    "steelseries",
+    "hyperx",
+    "razer",
+    "logitech",
+    "corsair",
+    "sennheiser",
+    "plantronics",
+    "poly",
+    "гарнитур",
+    "науш",
+)
+BUILTIN_MIC_KEYWORDS = (
+    "built-in",
+    "internal",
+    "integrated",
+    "microphone array",
+    "array",
+    "realtek",
+    "intel",
+    "встро",
+)
+VIRTUAL_MIC_KEYWORDS = (
+    "loopback",
+    "stereo mix",
+    "what u hear",
+    "monitor",
+    "virtual",
+    "cable",
+    "vb-audio",
+    "voicemeeter",
+)
+
+
 @dataclass(frozen=True)
 class AudioCaptureConfig:
     sample_rate_hertz: int = 16_000
@@ -49,17 +97,21 @@ def list_audio_devices() -> list[dict[str, Any]]:
     devices: list[dict[str, Any]] = []
     default_mic = safe_call(sc.default_microphone)
     default_speaker = safe_call(sc.default_speaker)
+    recommended_mic = safe_select_capture_device(sc, MIC_SOURCE)
+    recommended_loopback = safe_select_capture_device(sc, REMOTE_SOURCE)
 
     for device in sc.all_microphones(include_loopback=True):
         loopback = is_loopback_device(device)
+        recommended = same_device(device, recommended_loopback) if loopback else same_device(device, recommended_mic)
         devices.append(
             {
                 "id": device_id(device),
                 "name": device_name(device),
                 "source": REMOTE_SOURCE if loopback else MIC_SOURCE,
                 "loopback": loopback,
+                "recommended": recommended,
                 "default": same_device(device, default_mic)
-                or (loopback and same_device(device, default_speaker)),
+                or (loopback and devices_look_related(device, default_speaker)),
             }
         )
     return devices
@@ -82,10 +134,10 @@ def select_microphone(sc: Any, preferred_id: str | None = None) -> Any:
             return match
         raise AudioCaptureError(f"Microphone device was not found: {preferred_id}")
     default = safe_call(sc.default_microphone)
+    if microphones:
+        return max(microphones, key=lambda device: microphone_score(device, default))
     if default is not None:
         return default
-    if microphones:
-        return microphones[0]
     raise AudioCaptureError("No microphone capture devices were found")
 
 
@@ -104,7 +156,7 @@ def select_loopback(sc: Any, preferred_id: str | None = None) -> Any:
             if devices_look_related(device, speaker):
                 return device
     if loopbacks:
-        return loopbacks[0]
+        return max(loopbacks, key=lambda device: loopback_score(device, speaker))
     raise AudioCaptureError("No loopback capture device was found for system audio")
 
 
@@ -122,6 +174,13 @@ def safe_call(function: Any) -> Any | None:
     try:
         return function()
     except Exception:
+        return None
+
+
+def safe_select_capture_device(sc: Any, source: str) -> Any | None:
+    try:
+        return select_capture_device(sc, source)
+    except AudioCaptureError:
         return None
 
 
@@ -152,11 +211,42 @@ def same_device(left: Any, right: Any) -> bool:
 
 
 def devices_look_related(left: Any, right: Any) -> bool:
+    if right is None:
+        return False
     left_name = normalize_device_key(device_name(left))
     right_name = normalize_device_key(device_name(right))
     left_id = normalize_device_key(device_id(left))
     right_id = normalize_device_key(device_id(right))
     return right_name in left_name or left_name in right_name or right_id in left_id or left_id in right_id
+
+
+def microphone_score(device: Any, default: Any | None = None) -> int:
+    text = normalized_device_text(device)
+    score = 10
+    if same_device(device, default):
+        score += 20
+    if has_keyword(text, HEADSET_MIC_KEYWORDS):
+        score += 120
+    if has_keyword(text, BUILTIN_MIC_KEYWORDS):
+        score += 45
+    if has_keyword(text, VIRTUAL_MIC_KEYWORDS):
+        score -= 80
+    return score
+
+
+def loopback_score(device: Any, speaker: Any | None = None) -> int:
+    score = 10
+    if devices_look_related(device, speaker):
+        score += 100
+    return score
+
+
+def normalized_device_text(device: Any) -> str:
+    return f"{normalize_device_key(device_name(device))} {normalize_device_key(device_id(device))}"
+
+
+def has_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword in text for keyword in keywords)
 
 
 def device_id(device: Any) -> str:

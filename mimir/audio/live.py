@@ -146,6 +146,7 @@ class LiveAudioController:
             "sampleRateHertz": config.sample_rate_hertz if config else 16_000,
             "chunkDurationMs": config.chunk_duration_ms if config else 200,
             "vadEnabled": config.vad_enabled if config else True,
+            "deviceIds": dict(config.device_ids) if config else {},
         }
 
     def _run_source(self, source: str, api_key: str) -> None:

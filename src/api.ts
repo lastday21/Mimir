@@ -51,6 +51,7 @@ export interface AudioDevice {
   source: "remote" | "mic";
   loopback: boolean;
   default: boolean;
+  recommended: boolean;
 }
 
 export interface AudioDevicesPayload {
@@ -66,6 +67,7 @@ export interface LiveAudioSnapshot {
   sampleRateHertz: number;
   chunkDurationMs: number;
   vadEnabled: boolean;
+  deviceIds?: Partial<Record<"remote" | "mic", string>>;
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -121,10 +123,13 @@ export function stopSession(): Promise<SessionSnapshot> {
   });
 }
 
-export function startLiveAudio(sources: Array<"remote" | "mic">): Promise<LiveAudioSnapshot> {
+export function startLiveAudio(
+  sources: Array<"remote" | "mic">,
+  deviceIds: Partial<Record<"remote" | "mic", string>> = {}
+): Promise<LiveAudioSnapshot> {
   return request<LiveAudioSnapshot>("/api/session/audio/start", {
     method: "POST",
-    body: JSON.stringify({ sources, language: "ru-RU", vadEnabled: true })
+    body: JSON.stringify({ sources, deviceIds, language: "ru-RU", vadEnabled: true })
   });
 }
 

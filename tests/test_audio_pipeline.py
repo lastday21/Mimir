@@ -2,7 +2,7 @@ import time
 import unittest
 from collections.abc import Iterable, Iterator
 
-from mimir.audio.capture import AudioCaptureConfig, float_frames_to_pcm16
+from mimir.audio.capture import AudioCaptureConfig, float_frames_to_pcm16, select_loopback, select_microphone
 from mimir.audio.live import LiveAudioConfig, LiveAudioController, normalize_sources
 from mimir.audio.vad import EnergyVadConfig, EnergyVadGate
 from mimir.models import SpeechRecognitionResult
@@ -56,6 +56,38 @@ class FakeRecognizer:
             )
 
 
+class FakeAudioDevice:
+    def __init__(self, identifier: str, name: str, loopback: bool = False) -> None:
+        self.id = identifier
+        self.name = name
+        self.isloopback = loopback
+
+
+class FakeSoundcard:
+    def __init__(
+        self,
+        microphones: list[FakeAudioDevice],
+        loopbacks: list[FakeAudioDevice] | None = None,
+        default_mic: FakeAudioDevice | None = None,
+        default_speaker: FakeAudioDevice | None = None,
+    ) -> None:
+        self.microphones = microphones
+        self.loopbacks = loopbacks or []
+        self._default_mic = default_mic
+        self._default_speaker = default_speaker
+
+    def all_microphones(self, include_loopback: bool = False) -> list[FakeAudioDevice]:
+        if include_loopback:
+            return [*self.microphones, *self.loopbacks]
+        return self.microphones
+
+    def default_microphone(self) -> FakeAudioDevice | None:
+        return self._default_mic
+
+    def default_speaker(self) -> FakeAudioDevice | None:
+        return self._default_speaker
+
+
 class AudioPipelineTests(unittest.TestCase):
     def test_normalizes_audio_sources(self) -> None:
         self.assertEqual(normalize_sources(["system", "me", "remote"]), ("remote", "mic"))
@@ -66,6 +98,28 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertEqual(len(pcm), 6)
         self.assertEqual(int.from_bytes(pcm[:2], "little", signed=True), 16384)
         self.assertEqual(int.from_bytes(pcm[2:4], "little", signed=True), -32767)
+
+    def test_prefers_headset_microphone_over_default_builtin(self) -> None:
+        builtin = FakeAudioDevice("mic_builtin", "Microphone Array (Realtek Audio)")
+        headset = FakeAudioDevice("mic_headset", "Headset Microphone (Jabra)")
+        sc = FakeSoundcard([builtin, headset], default_mic=builtin)
+
+        self.assertIs(select_microphone(sc), headset)
+
+    def test_falls_back_to_builtin_microphone_without_headset(self) -> None:
+        webcam = FakeAudioDevice("mic_webcam", "HD Webcam Mic")
+        builtin = FakeAudioDevice("mic_builtin", "Internal Microphone Array")
+        sc = FakeSoundcard([webcam, builtin], default_mic=webcam)
+
+        self.assertIs(select_microphone(sc), builtin)
+
+    def test_selects_loopback_for_default_speaker_output(self) -> None:
+        speaker = FakeAudioDevice("speaker_sony", "Headphones (Sony)")
+        speakers_loopback = FakeAudioDevice("loop_sony", "Headphones (Sony) Loopback", loopback=True)
+        monitor_loopback = FakeAudioDevice("loop_monitor", "Monitor Speakers Loopback", loopback=True)
+        sc = FakeSoundcard([], [monitor_loopback, speakers_loopback], default_speaker=speaker)
+
+        self.assertIs(select_loopback(sc), speakers_loopback)
 
     def test_vad_keeps_speech_and_short_tail_silence(self) -> None:
         gate = EnergyVadGate(
