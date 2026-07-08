@@ -40,16 +40,19 @@ The backend exposes a session API:
 - `POST /api/session/transcript`
 - `POST /api/session/stt/wav`
 
-`/api/session/audio/start` starts independent live capture sources for remote
-loopback and mic audio. Both sources pass through a lightweight energy VAD,
-SpeechKit streaming, the shared transcript bus, dialogue memory, question
-trigger, context builder, and streaming LLM path.
+`/api/session/audio/start` starts live capture for remote loopback and mic
+audio. The default `yandex_realtime` mode streams remote loopback audio directly
+to Yandex AI Studio Realtime API and uses mic SpeechKit transcripts only as
+`MIC_CONTEXT`, so the assistant answers the other speaker and treats the user's
+speech as dialogue context. `speechkit` mode remains available as a fallback
+that sends both sources through the local SpeechKit transcript bus.
 
 `/api/session/transcript` remains a development input for direct transcript
 injection.
 
 SpeechKit streaming uses direct SpeechKit v3 gRPC through the generated stubs
-from the `yandexcloud` package.
+from the `yandexcloud` package. Realtime mode uses `aiohttp` WebSocket transport
+with the `speech-realtime-250923` model.
 
 `POST /api/session/stt/wav` accepts a mono 16-bit PCM WAV file as a development
 feeder. It streams recognition results into the same session memory and question

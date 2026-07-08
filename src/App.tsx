@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Bot, Check, Cloud, KeyRound, Loader2, MessageSquare, Pause, Play, Send, Server, Square, Zap } from "lucide-react";
 import {
   AppConfig,
+  AudioMode,
   AudioDevice,
   ModelInfo,
   QuestionEvent,
@@ -53,6 +54,7 @@ export function App() {
   const [audioLevels, setAudioLevels] = useState<Record<AudioSource, AudioLevel>>(emptyAudioLevels());
   const [liveRemote, setLiveRemote] = useState(true);
   const [liveMic, setLiveMic] = useState(true);
+  const [audioMode, setAudioMode] = useState<AudioMode>("yandex_realtime");
   const [audioRunning, setAudioRunning] = useState(false);
   const [status, setStatus] = useState("Start the Python API with python -m mimir");
   const [busy, setBusy] = useState(false);
@@ -262,9 +264,9 @@ export function App() {
     setBusy(true);
     try {
       setAudioLevels(emptyAudioLevels());
-      const snapshot = await startLiveAudio(sources, recommendedDeviceIds(audioDevices, sources));
+      const snapshot = await startLiveAudio(sources, recommendedDeviceIds(audioDevices, sources), audioMode);
       setAudioRunning(snapshot.running);
-      setStatus(`Audio streaming: ${snapshot.sources.join(" + ")}`);
+      setStatus(`Audio streaming: ${(snapshot.mode ?? audioMode).replace("_", " ")} ${snapshot.sources.join(" + ")}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to start audio");
     } finally {
@@ -438,12 +440,37 @@ export function App() {
           <span className="session-id">{session?.sessionId ?? "no session"}</span>
         </div>
         <div className="audio-row">
+          <select
+            className="audio-mode"
+            value={audioMode}
+            onChange={(event) => {
+              const nextMode = event.target.value as AudioMode;
+              setAudioMode(nextMode);
+              if (nextMode === "yandex_realtime") {
+                setLiveRemote(true);
+              }
+            }}
+            disabled={audioRunning}
+          >
+            <option value="yandex_realtime">Realtime</option>
+            <option value="speechkit">SpeechKit</option>
+          </select>
           <label className="check-row">
-            <input type="checkbox" checked={liveRemote} onChange={(event) => setLiveRemote(event.target.checked)} />
+            <input
+              type="checkbox"
+              checked={liveRemote}
+              disabled={audioRunning || audioMode === "yandex_realtime"}
+              onChange={(event) => setLiveRemote(event.target.checked)}
+            />
             Meet audio
           </label>
           <label className="check-row">
-            <input type="checkbox" checked={liveMic} onChange={(event) => setLiveMic(event.target.checked)} />
+            <input
+              type="checkbox"
+              checked={liveMic}
+              disabled={audioRunning}
+              onChange={(event) => setLiveMic(event.target.checked)}
+            />
             Mic
           </label>
           <button className="primary" onClick={handleStartLiveAudio} disabled={busy || audioRunning || (!liveRemote && !liveMic)}>

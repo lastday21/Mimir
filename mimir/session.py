@@ -59,7 +59,13 @@ class SessionManager:
             self.publish_locked("session_state", payload)
             return payload
 
-    def ingest_transcript(self, source: str, text: str, is_final: bool = True) -> dict[str, Any]:
+    def ingest_transcript(
+        self,
+        source: str,
+        text: str,
+        is_final: bool = True,
+        detect_question: bool = True,
+    ) -> dict[str, Any]:
         source = normalize_source(source)
         turn = DialogueTurn(source=source, text=text, is_final=is_final)
         with self._condition:
@@ -76,7 +82,7 @@ class SessionManager:
             }
             self.publish_locked("transcript", payload)
 
-        if turn.source == REMOTE_SOURCE and turn.is_final:
+        if detect_question and turn.source == REMOTE_SOURCE and turn.is_final:
             self._maybe_trigger_question(turn.text, turn.timestamp_ms)
         return payload
 

@@ -1,9 +1,11 @@
 import time
 import unittest
+from collections.abc import AsyncIterator
 from collections.abc import Iterable, Iterator
 
 from mimir.audio.capture import AudioCaptureConfig, float_frames_to_pcm16, select_loopback, select_microphone
 from mimir.audio.live import LiveAudioConfig, LiveAudioController, normalize_sources
+from mimir.audio.realtime import RealtimeAudioConfig, RealtimeAudioController
 from mimir.audio.vad import EnergyVadConfig, EnergyVadGate
 from mimir.models import SpeechRecognitionResult
 
@@ -23,7 +25,13 @@ class FakeSession:
         self.started = True
         return {"state": "listening"}
 
-    def ingest_transcript(self, source: str, text: str, is_final: bool = True) -> dict[str, object]:
+    def ingest_transcript(
+        self,
+        source: str,
+        text: str,
+        is_final: bool = True,
+        detect_question: bool = True,
+    ) -> dict[str, object]:
         self.transcripts.append((source, text, is_final))
         return {"source": source, "text": text, "isFinal": is_final}
 
@@ -173,6 +181,78 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertTrue(session.started)
         self.assertEqual(session.transcripts, [("remote", "ru-RU:16000:2", True)])
         self.assertTrue(any(event == "audio_status" for event, _payload in session.events))
+
+    def test_realtime_controller_sends_remote_audio_and_mic_context(self) -> None:
+        session = FakeSession()
+        appended_audio: list[bytes] = []
+        mic_contexts: list[str] = []
+        setup_calls: list[tuple[str, int]] = []
+
+        class FakeRealtimeClient:
+            def __init__(self, _config) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback) -> None:
+                pass
+
+            async def setup_session(self, instructions: str, sample_rate_hertz: int) -> None:
+                setup_calls.append((instructions, sample_rate_hertz))
+
+            async def append_audio(self, pcm: bytes) -> None:
+                appended_audio.append(pcm)
+
+            async def add_mic_context(self, text: str) -> None:
+                mic_contexts.append(text)
+
+            async def events(self) -> AsyncIterator[dict[str, object]]:
+                yield {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "Как вы проектировали очередь задач?",
+                }
+                yield {"type": "response.output_text.delta", "delta": "Начни с требований и ограничений."}
+                yield {"type": "response.output_text.done"}
+
+        def source_factory(source: str, _config: AudioCaptureConfig) -> FakePcmSource:
+            chunks = [pcm_constant(1000, 3200), pcm_constant(0, 1600)]
+            return FakePcmSource(chunks)
+
+        controller = RealtimeAudioController(
+            session,
+            lambda _key: FakeRecognizer(),
+            FakeRealtimeClient,
+            source_factory,
+        )
+
+        controller.start(
+            RealtimeAudioConfig(
+                sources=("remote", "mic"),
+                chunk_duration_ms=200,
+                vad=EnergyVadConfig(
+                    speech_rms_threshold=100,
+                    silence_rms_threshold=50,
+                    tail_silence_ms=500,
+                    min_speech_ms=1,
+                ),
+            ),
+            "test-key",
+            "folder-id",
+        )
+
+        deadline = time.monotonic() + 2
+        while controller.snapshot()["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertFalse(controller.snapshot()["running"])
+        self.assertTrue(session.started)
+        self.assertEqual(setup_calls[0][1], 16_000)
+        self.assertTrue(appended_audio)
+        self.assertEqual(mic_contexts, ["ru-RU:16000:2"])
+        self.assertIn(("remote", "Как вы проектировали очередь задач?", True), session.transcripts)
+        self.assertIn(("mic", "ru-RU:16000:2", True), session.transcripts)
+        self.assertTrue(any(event == "answer_delta" for event, _payload in session.events))
 
 
 if __name__ == "__main__":

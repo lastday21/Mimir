@@ -281,10 +281,14 @@ button:disabled {
 
 .audio-row {
   display: grid;
-  grid-template-columns: minmax(150px, 1fr) minmax(90px, 140px) auto auto;
+  grid-template-columns: minmax(130px, 160px) minmax(150px, 1fr) minmax(90px, 140px) auto auto;
   align-items: center;
   gap: 10px;
   margin-top: 12px;
+}
+
+.audio-mode {
+  min-height: 39px;
 }
 
 .audio-meter-grid {

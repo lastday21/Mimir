@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .audio import AudioCaptureError, LiveAudioConfig, LiveAudioController, list_audio_devices
+from .audio import (
+    AudioCaptureError,
+    LiveAudioConfig,
+    LiveAudioController,
+    RealtimeAudioConfig,
+    RealtimeAudioController,
+    list_audio_devices,
+)
 from .config import AppConfig, load_config, save_config
 from .credentials import read_secret, write_secret
 from .models import ModelInfo
@@ -25,6 +32,7 @@ STATIC_ROOT = Path(__file__).resolve().parents[1] / "dist"
 ALLOWED_CORS_HEADERS = "Content-Type"
 SESSION_MANAGER = SessionManager()
 LIVE_AUDIO = LiveAudioController(SESSION_MANAGER, YandexSpeechKitClient)
+REALTIME_AUDIO = RealtimeAudioController(SESSION_MANAGER, YandexSpeechKitClient)
 MAX_DEV_WAV_BYTES = 25_000_000
 
 
@@ -67,7 +75,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/session/audio/start":
                 self.handle_live_audio_start()
             elif parsed.path == "/api/session/audio/stop":
-                self.send_json(LIVE_AUDIO.stop())
+                self.handle_live_audio_stop()
             elif parsed.path == "/api/session/transcript":
                 self.handle_session_transcript()
             elif parsed.path == "/api/session/stt/wav":
@@ -122,6 +130,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def handle_session_stop(self) -> None:
         LIVE_AUDIO.stop()
+        REALTIME_AUDIO.stop()
         self.send_json(SESSION_MANAGER.stop())
 
     def handle_live_audio_start(self) -> None:
@@ -134,16 +143,51 @@ class ApiHandler(BaseHTTPRequestHandler):
         device_ids = payload.get("deviceIds") or {}
         if not isinstance(device_ids, dict):
             raise ValueError("deviceIds must be an object")
-        live_config = LiveAudioConfig(
-            sources=tuple(str(source) for source in sources),
-            language=str(payload.get("language") or "ru-RU"),
-            sample_rate_hertz=int(payload.get("sampleRateHertz") or 16_000),
-            chunk_duration_ms=int(payload.get("chunkDurationMs") or 200),
-            vad_enabled=bool(payload.get("vadEnabled", True)),
-            device_ids={str(key): str(value) for key, value in device_ids.items()},
+        common_config = {
+            "sources": tuple(str(source) for source in sources),
+            "language": str(payload.get("language") or "ru-RU"),
+            "sample_rate_hertz": int(payload.get("sampleRateHertz") or 16_000),
+            "chunk_duration_ms": int(payload.get("chunkDurationMs") or 200),
+            "vad_enabled": bool(payload.get("vadEnabled", True)),
+            "device_ids": {str(key): str(value) for key, value in device_ids.items()},
+        }
+        mode = str(payload.get("mode") or "yandex_realtime").strip().lower()
+        if mode == "speechkit":
+            REALTIME_AUDIO.stop()
+            key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
+            self.send_json(LIVE_AUDIO.start(LiveAudioConfig(**common_config), key))
+            return
+        if mode != "yandex_realtime":
+            raise ValueError("audio mode must be yandex_realtime or speechkit")
+
+        LIVE_AUDIO.stop()
+        config = load_config()
+        key = read_secret("yandex_ai_studio") or read_secret("yandex_speechkit") or ""
+        self.send_json(REALTIME_AUDIO.start(RealtimeAudioConfig(**common_config), key, config.yandex_folder_id))
+
+    def handle_live_audio_stop(self) -> None:
+        realtime_was_running = bool(REALTIME_AUDIO.snapshot().get("running"))
+        speechkit_was_running = bool(LIVE_AUDIO.snapshot().get("running"))
+        if realtime_was_running:
+            self.send_json(REALTIME_AUDIO.stop())
+            return
+        if speechkit_was_running:
+            self.send_json(LIVE_AUDIO.stop())
+            return
+        REALTIME_AUDIO.stop()
+        LIVE_AUDIO.stop()
+        self.send_json(
+            {
+                "running": False,
+                "mode": "idle",
+                "sources": [],
+                "language": "ru-RU",
+                "sampleRateHertz": 16_000,
+                "chunkDurationMs": 200,
+                "vadEnabled": True,
+                "deviceIds": {},
+            }
         )
-        key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
-        self.send_json(LIVE_AUDIO.start(live_config, key))
 
     def handle_session_transcript(self) -> None:
         payload = self.read_json()

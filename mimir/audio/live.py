@@ -141,6 +141,7 @@ class LiveAudioController:
         config = self._config
         return {
             "running": self._running,
+            "mode": "speechkit",
             "sources": sorted(self._active_sources),
             "language": config.language if config else "ru-RU",
             "sampleRateHertz": config.sample_rate_hertz if config else 16_000,

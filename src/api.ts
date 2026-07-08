@@ -1,4 +1,5 @@
 export type Provider = "yandex_ai_studio" | "ollama";
+export type AudioMode = "yandex_realtime" | "speechkit";
 
 export interface AppConfig {
   yandexFolderId: string;
@@ -62,6 +63,7 @@ export interface AudioDevicesPayload {
 
 export interface LiveAudioSnapshot {
   running: boolean;
+  mode?: AudioMode | "idle";
   sources: Array<"remote" | "mic">;
   language: string;
   sampleRateHertz: number;
@@ -125,11 +127,12 @@ export function stopSession(): Promise<SessionSnapshot> {
 
 export function startLiveAudio(
   sources: Array<"remote" | "mic">,
-  deviceIds: Partial<Record<"remote" | "mic", string>> = {}
+  deviceIds: Partial<Record<"remote" | "mic", string>> = {},
+  mode: AudioMode = "yandex_realtime"
 ): Promise<LiveAudioSnapshot> {
   return request<LiveAudioSnapshot>("/api/session/audio/start", {
     method: "POST",
-    body: JSON.stringify({ sources, deviceIds, language: "ru-RU", vadEnabled: true })
+    body: JSON.stringify({ sources, deviceIds, language: "ru-RU", mode, vadEnabled: true })
   });
 }
 

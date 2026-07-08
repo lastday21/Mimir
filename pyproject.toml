@@ -9,7 +9,7 @@ description = "Realtime interview assistant core with a Python backend"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Mimir contributors" }]
-dependencies = ["numpy>=1.26", "pywebview>=5.4", "soundcard>=0.4.3", "yandexcloud>=0.397.0"]
+dependencies = ["aiohttp>=3.9", "numpy>=1.26", "pywebview>=5.4", "soundcard>=0.4.3", "yandexcloud>=0.397.0"]
 
 [project.scripts]
 mimir = "mimir.server:main"
