@@ -213,6 +213,124 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             server.read_secret = original_read_secret
             server.load_config = original_load_config
 
+    def test_realtime_audio_preflight_rejects_missing_folder(self) -> None:
+        original_live_audio = server.LIVE_AUDIO
+        original_realtime_audio = server.REALTIME_AUDIO
+        original_read_secret = server.read_secret
+        original_load_config = server.load_config
+        original_list_audio_devices = server.list_audio_devices
+
+        class FakeAudio:
+            def snapshot(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+        class FakeConfig:
+            yandex_folder_id = ""
+
+        server.LIVE_AUDIO = FakeAudio()
+        server.REALTIME_AUDIO = FakeAudio()
+        server.read_secret = lambda name: "test-key" if name == "yandex_ai_studio" else ""
+        server.load_config = lambda: FakeConfig()
+        server.list_audio_devices = lambda: [
+            {"id": "remote1", "source": "remote"},
+            {"id": "mic1", "source": "mic"},
+        ]
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            body = json.dumps({"sources": ["remote", "mic"], "mode": "yandex_realtime"}).encode("utf-8")
+            conn = HTTPConnection(host, port, timeout=5)
+            conn.request(
+                "POST",
+                "/api/session/audio/preflight",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            conn.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertFalse(payload["ok"])
+            self.assertIn("Yandex folder ID is missing", payload["errors"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.LIVE_AUDIO = original_live_audio
+            server.REALTIME_AUDIO = original_realtime_audio
+            server.read_secret = original_read_secret
+            server.load_config = original_load_config
+            server.list_audio_devices = original_list_audio_devices
+
+    def test_realtime_audio_preflight_passes_ready_setup(self) -> None:
+        original_live_audio = server.LIVE_AUDIO
+        original_realtime_audio = server.REALTIME_AUDIO
+        original_read_secret = server.read_secret
+        original_load_config = server.load_config
+        original_list_audio_devices = server.list_audio_devices
+
+        class FakeAudio:
+            def snapshot(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+        class FakeConfig:
+            yandex_folder_id = "folder-id"
+
+        server.LIVE_AUDIO = FakeAudio()
+        server.REALTIME_AUDIO = FakeAudio()
+        server.read_secret = lambda name: "test-key" if name in {"yandex_ai_studio", "yandex_speechkit"} else ""
+        server.load_config = lambda: FakeConfig()
+        server.list_audio_devices = lambda: [
+            {"id": "remote1", "source": "remote"},
+            {"id": "mic1", "source": "mic"},
+        ]
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            body = json.dumps(
+                {
+                    "sources": ["remote", "mic"],
+                    "mode": "yandex_realtime",
+                    "deviceIds": {"remote": "remote1", "mic": "mic1"},
+                }
+            ).encode("utf-8")
+            conn = HTTPConnection(host, port, timeout=5)
+            conn.request(
+                "POST",
+                "/api/session/audio/preflight",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            conn.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["errors"], [])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.LIVE_AUDIO = original_live_audio
+            server.REALTIME_AUDIO = original_realtime_audio
+            server.read_secret = original_read_secret
+            server.load_config = original_load_config
+            server.list_audio_devices = original_list_audio_devices
+
 
 if __name__ == "__main__":
     unittest.main()

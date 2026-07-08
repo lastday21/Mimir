@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import threading
+from importlib import import_module
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(SESSION_MANAGER.start())
             elif parsed.path == "/api/session/stop":
                 self.handle_session_stop()
+            elif parsed.path == "/api/session/audio/preflight":
+                self.handle_live_audio_preflight()
             elif parsed.path == "/api/session/audio/start":
                 self.handle_live_audio_start()
             elif parsed.path == "/api/session/audio/stop":
@@ -133,25 +136,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         REALTIME_AUDIO.stop()
         self.send_json(SESSION_MANAGER.stop())
 
+    def handle_live_audio_preflight(self) -> None:
+        self.send_json(build_live_audio_preflight(self.read_json()))
+
     def handle_live_audio_start(self) -> None:
         payload = self.read_json()
-        sources = payload.get("sources") or ["remote", "mic"]
-        if isinstance(sources, str):
-            sources = [sources]
-        if not isinstance(sources, list):
-            raise ValueError("sources must be a list")
-        device_ids = payload.get("deviceIds") or {}
-        if not isinstance(device_ids, dict):
-            raise ValueError("deviceIds must be an object")
-        common_config = {
-            "sources": tuple(str(source) for source in sources),
-            "language": str(payload.get("language") or "ru-RU"),
-            "sample_rate_hertz": int(payload.get("sampleRateHertz") or 16_000),
-            "chunk_duration_ms": int(payload.get("chunkDurationMs") or 200),
-            "vad_enabled": bool(payload.get("vadEnabled", True)),
-            "device_ids": {str(key): str(value) for key, value in device_ids.items()},
-        }
-        mode = str(payload.get("mode") or "yandex_realtime").strip().lower()
+        mode, common_config = parse_live_audio_request(payload)
         if mode == "speechkit":
             REALTIME_AUDIO.stop()
             key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
@@ -317,6 +307,120 @@ def model_payload(model: ModelInfo) -> dict[str, Any]:
         "provider": model.provider,
         "contextWindow": model.context_window,
     }
+
+
+def parse_live_audio_request(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    sources = payload.get("sources") or ["remote", "mic"]
+    if isinstance(sources, str):
+        sources = [sources]
+    if not isinstance(sources, list):
+        raise ValueError("sources must be a list")
+    device_ids = payload.get("deviceIds") or {}
+    if not isinstance(device_ids, dict):
+        raise ValueError("deviceIds must be an object")
+    mode = str(payload.get("mode") or "yandex_realtime").strip().lower()
+    if mode not in {"yandex_realtime", "speechkit"}:
+        raise ValueError("audio mode must be yandex_realtime or speechkit")
+    return (
+        mode,
+        {
+            "sources": tuple(normalize_live_audio_source(str(source)) for source in sources),
+            "language": str(payload.get("language") or "ru-RU"),
+            "sample_rate_hertz": int(payload.get("sampleRateHertz") or 16_000),
+            "chunk_duration_ms": int(payload.get("chunkDurationMs") or 200),
+            "vad_enabled": bool(payload.get("vadEnabled", True)),
+            "device_ids": {str(key): str(value) for key, value in device_ids.items()},
+        },
+    )
+
+
+def build_live_audio_preflight(payload: dict[str, Any]) -> dict[str, Any]:
+    mode, common_config = parse_live_audio_request(payload)
+    sources = list(common_config["sources"])
+    device_ids = dict(common_config["device_ids"])
+    checks: list[dict[str, Any]] = []
+
+    add_preflight_check(checks, "audio_idle", not audio_is_running(), "Live audio is already running")
+    if mode == "yandex_realtime":
+        config = load_config()
+        add_preflight_check(checks, "yandex_folder_id", bool(config.yandex_folder_id.strip()), "Yandex folder ID is missing")
+        add_preflight_check(
+            checks,
+            "yandex_ai_studio_key",
+            bool(read_secret("yandex_ai_studio") or read_secret("yandex_speechkit")),
+            "Yandex AI Studio API key is missing",
+        )
+        add_import_check(checks, "aiohttp", "aiohttp", "Realtime websocket dependency is missing")
+        if "mic" in sources:
+            add_speechkit_checks(checks)
+    elif mode == "speechkit":
+        add_speechkit_checks(checks)
+
+    add_device_checks(checks, sources, device_ids)
+    errors = [str(check["detail"]) for check in checks if not check["ok"]]
+    return {
+        "ok": not errors,
+        "mode": mode,
+        "sources": sources,
+        "deviceIds": device_ids,
+        "checks": checks,
+        "errors": errors,
+    }
+
+
+def add_speechkit_checks(checks: list[dict[str, Any]]) -> None:
+    add_preflight_check(
+        checks,
+        "yandex_speechkit_key",
+        bool(read_secret("yandex_speechkit") or read_secret("yandex_ai_studio")),
+        "Yandex SpeechKit API key is missing",
+    )
+    add_import_check(checks, "grpc", "grpc", "SpeechKit gRPC dependency is missing")
+    add_import_check(checks, "yandexcloud_stt", "yandex.cloud.ai.stt.v3.stt_service_pb2_grpc", "SpeechKit stubs are missing")
+
+
+def normalize_live_audio_source(source: str) -> str:
+    value = source.strip().lower()
+    if value in {"remote", "them", "system", "loopback"}:
+        return "remote"
+    if value in {"mic", "me", "user"}:
+        return "mic"
+    raise ValueError("audio source must be remote or mic")
+
+
+def add_device_checks(checks: list[dict[str, Any]], sources: list[str], device_ids: dict[str, str]) -> None:
+    try:
+        devices = list_audio_devices()
+    except AudioCaptureError as error:
+        add_preflight_check(checks, "audio_devices", False, str(error))
+        return
+
+    add_preflight_check(checks, "audio_devices", True, f"{len(devices)} capture devices available")
+    for source in sources:
+        source_devices = [device for device in devices if device.get("source") == source]
+        device_id = device_ids.get(source)
+        if device_id:
+            ok = any(str(device.get("id")) == device_id for device in source_devices)
+            add_preflight_check(checks, f"{source}_device", ok, f"{source} device is not available: {device_id}")
+        else:
+            add_preflight_check(checks, f"{source}_device", bool(source_devices), f"No {source} capture device is available")
+
+
+def add_import_check(checks: list[dict[str, Any]], name: str, module: str, error: str) -> None:
+    try:
+        import_module(module)
+    except ImportError:
+        add_preflight_check(checks, name, False, error)
+        return
+    add_preflight_check(checks, name, True, "available")
+
+
+def add_preflight_check(checks: list[dict[str, Any]], name: str, ok: bool, detail: str) -> None:
+    checks.append({"name": name, "ok": ok, "detail": detail})
+
+
+def audio_is_running() -> bool:
+    return bool(REALTIME_AUDIO.snapshot().get("running") or LIVE_AUDIO.snapshot().get("running"))
 
 
 def run_wav_stt_job(job_id: str, source: str, language: str, chunk_duration_ms: int, data: bytes, key: str) -> None:

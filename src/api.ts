@@ -74,6 +74,21 @@ export interface LiveAudioSnapshot {
   lastError?: string;
 }
 
+export interface AudioPreflightCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface AudioPreflightResult {
+  ok: boolean;
+  mode: AudioMode;
+  sources: Array<"remote" | "mic">;
+  deviceIds: Partial<Record<"remote" | "mic", string>>;
+  checks: AudioPreflightCheck[];
+  errors: string[];
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...options,
@@ -133,6 +148,17 @@ export function startLiveAudio(
   mode: AudioMode = "yandex_realtime"
 ): Promise<LiveAudioSnapshot> {
   return request<LiveAudioSnapshot>("/api/session/audio/start", {
+    method: "POST",
+    body: JSON.stringify({ sources, deviceIds, language: "ru-RU", mode, vadEnabled: true })
+  });
+}
+
+export function preflightLiveAudio(
+  sources: Array<"remote" | "mic">,
+  deviceIds: Partial<Record<"remote" | "mic", string>> = {},
+  mode: AudioMode = "yandex_realtime"
+): Promise<AudioPreflightResult> {
+  return request<AudioPreflightResult>("/api/session/audio/preflight", {
     method: "POST",
     body: JSON.stringify({ sources, deviceIds, language: "ru-RU", mode, vadEnabled: true })
   });

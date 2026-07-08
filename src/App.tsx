@@ -11,6 +11,7 @@ import {
   getConfig,
   listAudioDevices,
   listModels,
+  preflightLiveAudio,
   saveConfig,
   sendTranscript,
   startLiveAudio,
@@ -264,7 +265,13 @@ export function App() {
     setBusy(true);
     try {
       setAudioLevels(emptyAudioLevels());
-      const snapshot = await startLiveAudio(sources, recommendedDeviceIds(audioDevices, sources), audioMode);
+      const deviceIds = recommendedDeviceIds(audioDevices, sources);
+      const preflight = await preflightLiveAudio(sources, deviceIds, audioMode);
+      if (!preflight.ok) {
+        setStatus(preflight.errors[0] || "Audio preflight failed");
+        return;
+      }
+      const snapshot = await startLiveAudio(sources, deviceIds, audioMode);
       setAudioRunning(snapshot.running);
       setStatus(`Audio streaming: ${(snapshot.mode ?? audioMode).replace("_", " ")} ${snapshot.sources.join(" + ")}`);
     } catch (error) {
