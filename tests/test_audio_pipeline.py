@@ -254,6 +254,77 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertIn(("mic", "ru-RU:16000:2", True), session.transcripts)
         self.assertTrue(any(event == "answer_delta" for event, _payload in session.events))
 
+    def test_realtime_controller_reconnects_after_receive_error(self) -> None:
+        session = FakeSession()
+        connections: list[int] = []
+
+        class FlakyRealtimeClient:
+            def __init__(self, _config) -> None:
+                self.index = len(connections) + 1
+                connections.append(self.index)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback) -> None:
+                pass
+
+            async def setup_session(self, instructions: str, sample_rate_hertz: int) -> None:
+                pass
+
+            async def append_audio(self, pcm: bytes) -> None:
+                pass
+
+            async def add_mic_context(self, text: str) -> None:
+                pass
+
+            async def events(self) -> AsyncIterator[dict[str, object]]:
+                if self.index == 1:
+                    raise RuntimeError("socket dropped")
+                yield {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "Почему нужен reconnect?",
+                }
+                yield {"type": "response.output_text.delta", "delta": "Потому что сеть может оборваться."}
+                yield {"type": "response.output_text.done"}
+
+        controller = RealtimeAudioController(
+            session,
+            lambda _key: FakeRecognizer(),
+            FlakyRealtimeClient,
+            lambda _source, _config: FakePcmSource([pcm_constant(1000, 3200), pcm_constant(0, 1600)]),
+        )
+
+        controller.start(
+            RealtimeAudioConfig(
+                sources=("remote",),
+                chunk_duration_ms=200,
+                vad=EnergyVadConfig(
+                    speech_rms_threshold=100,
+                    silence_rms_threshold=50,
+                    tail_silence_ms=500,
+                    min_speech_ms=1,
+                ),
+            ),
+            "test-key",
+            "folder-id",
+        )
+
+        deadline = time.monotonic() + 4
+        while controller.snapshot()["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertFalse(controller.snapshot()["running"])
+        self.assertGreaterEqual(len(connections), 2)
+        self.assertIn(("remote", "Почему нужен reconnect?", True), session.transcripts)
+        self.assertTrue(any(event == "answer_delta" for event, _payload in session.events))
+        self.assertTrue(
+            any(
+                event == "audio_error" and payload.get("phase") == "reconnect"
+                for event, payload in session.events
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,10 @@ from .live import PcmSource, PcmSourceFactory, RecognizerFactory, default_source
 from .vad import EnergyVadConfig, EnergyVadGate
 
 
+REALTIME_RECONNECT_LIMIT = 3
+REALTIME_RECONNECT_BASE_DELAY_SECONDS = 0.4
+REALTIME_DRAIN_IDLE_SECONDS = 0.2
+
 REALTIME_INSTRUCTIONS = """
 Ты live-assistant для пользователя на интервью или рабочем созвоне.
 
@@ -54,6 +58,7 @@ class RealtimeSessionSink(Protocol):
 
 
 RealtimeClientFactory = Callable[[YandexRealtimeConfig], RealtimeClientProtocol]
+RealtimeQueueItem = tuple[str, str, bytes | str]
 
 
 @dataclass(frozen=True)
@@ -85,6 +90,7 @@ class RealtimeAudioController:
         self._running = False
         self._active_sources: set[str] = set()
         self._config: RealtimeAudioConfig | None = None
+        self._last_error = ""
 
     def start(self, config: RealtimeAudioConfig, api_key: str, folder_id: str) -> dict[str, object]:
         key = api_key.strip()
@@ -96,8 +102,15 @@ class RealtimeAudioController:
         if REMOTE_SOURCE not in sources:
             raise ValueError("Yandex Realtime mode requires remote audio")
 
+        stale_thread = self._stale_thread()
+        if stale_thread is not None:
+            stale_thread.join(timeout=3)
+            if stale_thread.is_alive():
+                raise ProviderError("Previous Yandex Realtime audio session is still stopping")
+
         with self._lock:
-            if self._running:
+            self._prune_thread_locked()
+            if self._running or self._thread is not None:
                 return self.snapshot_locked()
             self._stop_event = threading.Event()
             self._config = RealtimeAudioConfig(
@@ -111,6 +124,7 @@ class RealtimeAudioController:
             )
             self._active_sources = set(sources)
             self._running = True
+            self._last_error = ""
             stop_event = self._stop_event
 
         self.session.start()
@@ -146,7 +160,7 @@ class RealtimeAudioController:
         with self._lock:
             stop_event = self._stop_event
             thread = self._thread
-            was_running = self._running
+            was_running = self._running or bool(thread and thread.is_alive())
             self._running = False
             self._active_sources = set()
         if not was_running:
@@ -158,6 +172,9 @@ class RealtimeAudioController:
             stop_event.set()
         if thread is not None:
             thread.join(timeout=3)
+            if thread.is_alive():
+                self._publish_error(REMOTE_SOURCE, "Yandex Realtime audio did not stop within timeout", running=False, phase="stop")
+                return self.snapshot()
         with self._lock:
             if self._thread is thread:
                 self._thread = None
@@ -181,6 +198,7 @@ class RealtimeAudioController:
             "vadEnabled": config.vad_enabled if config else True,
             "deviceIds": dict(config.device_ids) if config else {},
             "tracePath": trace_path_payload(),
+            "lastError": self._last_error,
         }
 
     def _run(self, api_key: str, folder_id: str, stop_event: threading.Event | None) -> None:
@@ -189,30 +207,80 @@ class RealtimeAudioController:
         try:
             asyncio.run(self._run_async(api_key, folder_id, stop_event))
         except Exception as error:
-            self.publish(
-                "audio_error",
-                {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "error": str(error), "running": False},
-            )
+            self._publish_error(REMOTE_SOURCE, str(error), running=False, phase="run")
         finally:
             with self._lock:
                 self._running = False
                 self._active_sources = set()
-                self._stop_event = None
+                if self._stop_event is stop_event:
+                    self._stop_event = None
+                if self._thread is threading.current_thread():
+                    self._thread = None
             self.publish("audio_status", {"status": "idle", "mode": "yandex_realtime", "running": False})
 
     async def _run_async(self, api_key: str, folder_id: str, stop_event: threading.Event) -> None:
         config = self._config
         if config is None:
             return
-        queue: asyncio.Queue[tuple[str, str, bytes | str]] = asyncio.Queue(maxsize=200)
+        queue: asyncio.Queue[RealtimeQueueItem] = asyncio.Queue(maxsize=200)
         loop = asyncio.get_running_loop()
         producers = self._start_producers(config, stop_event, loop, queue, api_key)
         realtime_config = YandexRealtimeConfig(api_key=api_key, folder_id=folder_id)
+        reconnects = 0
 
+        try:
+            while not stop_event.is_set():
+                try:
+                    await self._run_realtime_connection(realtime_config, config, queue, producers, stop_event)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    if stop_event.is_set():
+                        return
+                    reconnects += 1
+                    self._publish_error(
+                        REMOTE_SOURCE,
+                        f"Yandex Realtime connection lost: {error}",
+                        running=True,
+                        phase="reconnect",
+                    )
+                    if reconnects > REALTIME_RECONNECT_LIMIT:
+                        raise ProviderError("Yandex Realtime reconnect limit exceeded") from error
+                    delay = min(2.0, REALTIME_RECONNECT_BASE_DELAY_SECONDS * reconnects)
+                    trace_live_event("realtime.reconnect", attempt=reconnects, delaySeconds=delay, error=str(error))
+                    self.publish(
+                        "audio_status",
+                        {
+                            "source": REMOTE_SOURCE,
+                            "mode": "yandex_realtime",
+                            "status": "reconnecting",
+                            "running": True,
+                            "attempt": reconnects,
+                        },
+                    )
+                    await asyncio.sleep(delay)
+        finally:
+            stop_event.set()
+            for thread in producers:
+                thread.join(timeout=1.5)
+
+    async def _run_realtime_connection(
+        self,
+        realtime_config: YandexRealtimeConfig,
+        config: RealtimeAudioConfig,
+        queue: asyncio.Queue[RealtimeQueueItem],
+        producers: list[threading.Thread],
+        stop_event: threading.Event,
+    ) -> None:
         async with self.realtime_factory(realtime_config) as client:
             await client.setup_session(REALTIME_INSTRUCTIONS, config.sample_rate_hertz)
-            sender = asyncio.create_task(self._send_events(client, queue, stop_event))
-            receiver = asyncio.create_task(self._receive_events(client, stop_event))
+            self.publish(
+                "audio_status",
+                {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "status": "connected", "running": True},
+            )
+            sender = asyncio.create_task(self._send_events(client, queue, stop_event), name="mimir-realtime-send")
+            receiver = asyncio.create_task(self._receive_events(client, stop_event), name="mimir-realtime-receive")
             try:
                 drained_at: float | None = None
                 while not stop_event.is_set():
@@ -220,23 +288,24 @@ class RealtimeAudioController:
                         drained_at = None
                     elif drained_at is None:
                         drained_at = time.monotonic()
-                    elif time.monotonic() - drained_at >= 0.2:
+                    elif time.monotonic() - drained_at >= REALTIME_DRAIN_IDLE_SECONDS:
                         break
+                    self._raise_task_error(sender, "Realtime sender failed")
+                    self._raise_task_error(receiver, "Realtime receiver failed")
+                    if receiver.done() and any(thread.is_alive() for thread in producers):
+                        raise ProviderError("Yandex Realtime websocket closed")
                     await asyncio.sleep(0.05)
             finally:
-                stop_event.set()
                 sender.cancel()
                 receiver.cancel()
                 await asyncio.gather(sender, receiver, return_exceptions=True)
-                for thread in producers:
-                    thread.join(timeout=1.5)
 
     def _start_producers(
         self,
         config: RealtimeAudioConfig,
         stop_event: threading.Event,
         loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue[tuple[str, str, bytes | str]],
+        queue: asyncio.Queue[RealtimeQueueItem],
         api_key: str,
     ) -> list[threading.Thread]:
         producers: list[threading.Thread] = []
@@ -267,7 +336,7 @@ class RealtimeAudioController:
         config: RealtimeAudioConfig,
         stop_event: threading.Event,
         loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue[tuple[str, str, bytes | str]],
+        queue: asyncio.Queue[RealtimeQueueItem],
     ) -> None:
         self.publish("audio_status", {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "status": "streaming", "running": True})
         try:
@@ -278,10 +347,7 @@ class RealtimeAudioController:
                 trace_live_event("audio.remote.enqueue", bytes=len(chunk))
                 self._put(loop, queue, ("remote_audio", REMOTE_SOURCE, chunk))
         except Exception as error:
-            self.publish(
-                "audio_error",
-                {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "error": str(error), "running": self.snapshot()["running"]},
-            )
+            self._publish_error(REMOTE_SOURCE, str(error), running=bool(self.snapshot()["running"]), phase="remote_producer")
         finally:
             self._finish_source(REMOTE_SOURCE)
 
@@ -290,7 +356,7 @@ class RealtimeAudioController:
         config: RealtimeAudioConfig,
         stop_event: threading.Event,
         loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue[tuple[str, str, bytes | str]],
+        queue: asyncio.Queue[RealtimeQueueItem],
         api_key: str,
     ) -> None:
         self.publish("audio_status", {"source": MIC_SOURCE, "mode": "yandex_realtime", "status": "context", "running": True})
@@ -311,17 +377,14 @@ class RealtimeAudioController:
                     trace_live_event("audio.mic.context.enqueue", text=event.text)
                     self._put(loop, queue, ("mic_context", MIC_SOURCE, event.text))
         except Exception as error:
-            self.publish(
-                "audio_error",
-                {"source": MIC_SOURCE, "mode": "yandex_realtime", "error": str(error), "running": self.snapshot()["running"]},
-            )
+            self._publish_error(MIC_SOURCE, str(error), running=bool(self.snapshot()["running"]), phase="mic_producer")
         finally:
             self._finish_source(MIC_SOURCE)
 
     async def _send_events(
         self,
         client: RealtimeClientProtocol,
-        queue: asyncio.Queue[tuple[str, str, bytes | str]],
+        queue: asyncio.Queue[RealtimeQueueItem],
         stop_event: threading.Event,
     ) -> None:
         while not stop_event.is_set():
@@ -381,8 +444,7 @@ class RealtimeAudioController:
             elif event_type == "error":
                 error = message.get("error") or {}
                 text = str(error.get("message") if isinstance(error, dict) else error)
-                trace_live_event("realtime.error", error=text)
-                self.publish("audio_error", {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "error": text, "running": True})
+                self._publish_error(REMOTE_SOURCE, text, running=True, phase="server_event")
 
     def _publish_realtime_question(self, text: str) -> str:
         question_id = f"realtime_{uuid.uuid4().hex[:12]}"
@@ -452,24 +514,57 @@ class RealtimeAudioController:
     def _put(
         self,
         loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue[tuple[str, str, bytes | str]],
-        item: tuple[str, str, bytes | str],
+        queue: asyncio.Queue[RealtimeQueueItem],
+        item: RealtimeQueueItem,
     ) -> None:
         def put_nowait() -> None:
             try:
                 queue.put_nowait(item)
             except asyncio.QueueFull:
-                self.publish(
-                    "audio_error",
-                    {
-                        "source": item[1],
-                        "mode": "yandex_realtime",
-                        "error": "Realtime audio queue is full",
-                        "running": self.snapshot()["running"],
-                    },
-                )
+                self._publish_error(item[1], "Realtime audio queue is full", running=bool(self.snapshot()["running"]), phase="queue")
 
         loop.call_soon_threadsafe(put_nowait)
 
     def publish(self, event: str, payload: dict[str, object]) -> None:
         self.session.publish_status(event, payload)
+
+    def _publish_error(self, source: str, error: str, *, running: bool, phase: str) -> None:
+        with self._lock:
+            self._last_error = error
+        trace_live_event("audio.error", source=source, mode="yandex_realtime", phase=phase, error=error, running=running)
+        self.publish(
+            "audio_error",
+            {
+                "source": source,
+                "mode": "yandex_realtime",
+                "phase": phase,
+                "error": error,
+                "running": running,
+            },
+        )
+
+    def _stale_thread(self) -> threading.Thread | None:
+        with self._lock:
+            thread = self._thread
+            if thread is not None and not thread.is_alive():
+                self._thread = None
+                self._stop_event = None
+                return None
+            if thread is not None and thread.is_alive() and not self._running:
+                return thread
+            return None
+
+    def _prune_thread_locked(self) -> None:
+        if self._thread is not None and not self._thread.is_alive():
+            self._thread = None
+            self._stop_event = None
+
+    @staticmethod
+    def _raise_task_error(task: asyncio.Task[object], message: str) -> None:
+        if not task.done():
+            return
+        if task.cancelled():
+            raise ProviderError(message)
+        error = task.exception()
+        if error is not None:
+            raise ProviderError(f"{message}: {error}") from error
