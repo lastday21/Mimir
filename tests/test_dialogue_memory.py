@@ -21,6 +21,20 @@ class DialogueMemoryTests(unittest.TestCase):
         self.assertIn("воркерами", context.transcript_excerpt)
         self.assertEqual(context.relevant_prior_questions[-1], "Расскажите, как вы проектировали очередь задач")
 
+    def test_realtime_context_keeps_role_labeled_final_turns(self) -> None:
+        memory = DialogueMemory()
+        memory.append(DialogueTurn(REMOTE_SOURCE, "интерим", is_final=False))
+        memory.append(DialogueTurn(REMOTE_SOURCE, "Расскажите про Kafka"))
+        memory.append(DialogueTurn(MIC_SOURCE, "угу"))
+        memory.append(DialogueTurn(MIC_SOURCE, "Я использовал Kafka для событий между сервисами"))
+
+        context = memory.realtime_context(max_turns=3, max_chars=500)
+
+        self.assertNotIn("интерим", context)
+        self.assertIn("Собеседник: Расскажите про Kafka", context)
+        self.assertIn("Пользователь: угу", context)
+        self.assertIn("Пользователь: Я использовал Kafka", context)
+
 
 if __name__ == "__main__":
     unittest.main()

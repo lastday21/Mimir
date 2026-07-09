@@ -27,7 +27,7 @@ class RealtimeClientProtocol(Protocol):
     async def append_audio(self, pcm: bytes) -> None:
         ...
 
-    async def add_mic_context(self, text: str) -> None:
+    async def add_dialogue_context(self, text: str) -> None:
         ...
 
     async def events(self) -> AsyncIterator[dict[str, Any]]:
@@ -124,11 +124,11 @@ class YandexRealtimeClient:
             }
         )
 
-    async def add_mic_context(self, text: str) -> None:
+    async def add_dialogue_context(self, text: str) -> None:
         normalized = text.strip()
         if not normalized:
             return
-        trace_live_event("realtime.out.conversation.item.create", source="mic", text=normalized)
+        trace_live_event("realtime.out.conversation.item.create", source="dialogue_context", chars=len(normalized))
         await self._send(
             {
                 "type": "conversation.item.create",
@@ -138,11 +138,11 @@ class YandexRealtimeClient:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": f"MIC_CONTEXT: Пользователь ответил собеседнику: {normalized}",
+                            "text": f"DIALOGUE_CONTEXT:\n{normalized}",
                         }
                     ],
                     "metadata": {
-                        "source": "mic",
+                        "source": "dialogue",
                         "purpose": "context_only",
                     },
                 },

@@ -22,21 +22,22 @@ from .vad import EnergyVadConfig, EnergyVadGate
 REALTIME_RECONNECT_LIMIT = 3
 REALTIME_RECONNECT_BASE_DELAY_SECONDS = 0.4
 REALTIME_DRAIN_IDLE_SECONDS = 0.2
+REALTIME_CONTEXT_TURNS = 12
+REALTIME_CONTEXT_CHARS = 1800
 
 REALTIME_INSTRUCTIONS = """
 Ты live-assistant для пользователя на интервью или рабочем созвоне.
 
 Аудиопоток, который ты слышишь напрямую, это только remote: речь собеседника.
-Текстовые сообщения с префиксом MIC_CONTEXT - это слова пользователя в созвоне.
+Текстовые сообщения с префиксом DIALOGUE_CONTEXT - это готовый фоновый контекст последних реплик с ролями.
 
 Правила:
 - отвечай только когда remote задал пользователю содержательный вопрос, попросил объяснить, спроектировать, сравнить или привести пример;
-- MIC_CONTEXT никогда не является вопросом к тебе, используй его только как контекст того, что пользователь уже сказал;
-- не отвечай на короткий разговорный шум: "да?", "нет?", "угу?", "окей?", "понятно?";
+- DIALOGUE_CONTEXT никогда не является вопросом к тебе, используй его только как историю разговора;
 - если remote не задал полезный вопрос, не давай подсказку;
 - ответ должен быть короткой подсказкой для пользователя, а не репликой в созвон;
 - пиши по-русски, если вопрос на русском, иначе на языке вопроса;
-- не повторяй то, что пользователь уже сказал в MIC_CONTEXT, а дополняй следующий ответ.
+- не повторяй то, что пользователь уже сказал в DIALOGUE_CONTEXT, а дополняй следующий ответ.
 """.strip()
 
 
@@ -54,6 +55,9 @@ class RealtimeSessionSink(Protocol):
         ...
 
     def publish_status(self, event: str, payload: dict[str, object]) -> None:
+        ...
+
+    def realtime_context(self, max_turns: int = 12, max_chars: int = 1800) -> str:
         ...
 
 
@@ -91,6 +95,7 @@ class RealtimeAudioController:
         self._active_sources: set[str] = set()
         self._config: RealtimeAudioConfig | None = None
         self._last_error = ""
+        self._last_dialogue_context = ""
 
     def start(self, config: RealtimeAudioConfig, api_key: str, folder_id: str) -> dict[str, object]:
         key = api_key.strip()
@@ -125,6 +130,7 @@ class RealtimeAudioController:
             self._active_sources = set(sources)
             self._running = True
             self._last_error = ""
+            self._last_dialogue_context = ""
             stop_event = self._stop_event
 
         self.session.start()
@@ -275,12 +281,15 @@ class RealtimeAudioController:
     ) -> None:
         async with self.realtime_factory(realtime_config) as client:
             await client.setup_session(REALTIME_INSTRUCTIONS, config.sample_rate_hertz)
+            with self._lock:
+                self._last_dialogue_context = ""
+            self._enqueue_dialogue_context_now(queue, "session")
             self.publish(
                 "audio_status",
                 {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "status": "connected", "running": True},
             )
             sender = asyncio.create_task(self._send_events(client, queue, stop_event), name="mimir-realtime-send")
-            receiver = asyncio.create_task(self._receive_events(client, stop_event), name="mimir-realtime-receive")
+            receiver = asyncio.create_task(self._receive_events(client, queue, stop_event), name="mimir-realtime-receive")
             try:
                 drained_at: float | None = None
                 while not stop_event.is_set():
@@ -375,8 +384,7 @@ class RealtimeAudioController:
                 self.record_stt_result(MIC_SOURCE, event.is_final)
                 self.session.ingest_transcript(MIC_SOURCE, event.text, is_final=event.is_final, detect_question=False)
                 if event.is_final and event.text.strip():
-                    trace_live_event("audio.mic.context.enqueue", text=event.text)
-                    self._put(loop, queue, ("mic_context", MIC_SOURCE, event.text))
+                    self._enqueue_dialogue_context(loop, queue, MIC_SOURCE)
         except Exception as error:
             self._publish_error(MIC_SOURCE, str(error), running=bool(self.snapshot()["running"]), phase="mic_producer")
         finally:
@@ -396,11 +404,16 @@ class RealtimeAudioController:
             if kind == "remote_audio" and isinstance(payload, bytes):
                 trace_live_event("realtime.remote.send", bytes=len(payload))
                 await client.append_audio(payload)
-            elif kind == "mic_context" and isinstance(payload, str):
-                trace_live_event("realtime.mic_context.send", text=payload)
-                await client.add_mic_context(payload)
+            elif kind == "dialogue_context" and isinstance(payload, str):
+                trace_live_event("realtime.dialogue_context.send", source=_source, chars=len(payload))
+                await client.add_dialogue_context(payload)
 
-    async def _receive_events(self, client: RealtimeClientProtocol, stop_event: threading.Event) -> None:
+    async def _receive_events(
+        self,
+        client: RealtimeClientProtocol,
+        queue: asyncio.Queue[RealtimeQueueItem],
+        stop_event: threading.Event,
+    ) -> None:
         current_question_id = ""
         last_remote_text = ""
         async for message in client.events():
@@ -414,6 +427,7 @@ class RealtimeAudioController:
                     last_remote_text = text
                     self.record_stt_result(REMOTE_SOURCE, True)
                     self.session.ingest_transcript(REMOTE_SOURCE, text, is_final=True, detect_question=False)
+                    self._enqueue_dialogue_context_now(queue, REMOTE_SOURCE)
             elif event_type == "conversation.item.input_audio_transcription.delta":
                 delta = str(message.get("delta") or "").strip()
                 if delta:
@@ -520,6 +534,41 @@ class RealtimeAudioController:
         with self._lock:
             self._active_sources.discard(source)
 
+    def _enqueue_dialogue_context(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue[RealtimeQueueItem],
+        source: str,
+    ) -> None:
+        context = self._take_dialogue_context_update()
+        if not context:
+            return
+        trace_live_event("audio.dialogue_context.enqueue", source=source, chars=len(context))
+        self._put(loop, queue, ("dialogue_context", source, context))
+
+    def _enqueue_dialogue_context_now(self, queue: asyncio.Queue[RealtimeQueueItem], source: str) -> None:
+        context = self._take_dialogue_context_update()
+        if not context:
+            return
+        trace_live_event("audio.dialogue_context.enqueue", source=source, chars=len(context))
+        self._put_nowait(queue, ("dialogue_context", source, context))
+
+    def _take_dialogue_context_update(self) -> str:
+        context = self._latest_dialogue_context()
+        if not context:
+            return ""
+        with self._lock:
+            if context == self._last_dialogue_context:
+                return ""
+            self._last_dialogue_context = context
+        return context
+
+    def _latest_dialogue_context(self) -> str:
+        builder = getattr(self.session, "realtime_context", None)
+        if not callable(builder):
+            return ""
+        return str(builder(max_turns=REALTIME_CONTEXT_TURNS, max_chars=REALTIME_CONTEXT_CHARS)).strip()
+
     def _put(
         self,
         loop: asyncio.AbstractEventLoop,
@@ -527,12 +576,15 @@ class RealtimeAudioController:
         item: RealtimeQueueItem,
     ) -> None:
         def put_nowait() -> None:
-            try:
-                queue.put_nowait(item)
-            except asyncio.QueueFull:
-                self._publish_error(item[1], "Realtime audio queue is full", running=bool(self.snapshot()["running"]), phase="queue")
+            self._put_nowait(queue, item)
 
         loop.call_soon_threadsafe(put_nowait)
+
+    def _put_nowait(self, queue: asyncio.Queue[RealtimeQueueItem], item: RealtimeQueueItem) -> None:
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self._publish_error(item[1], "Realtime audio queue is full", running=bool(self.snapshot()["running"]), phase="queue")
 
     def publish(self, event: str, payload: dict[str, object]) -> None:
         self.session.publish_status(event, payload)

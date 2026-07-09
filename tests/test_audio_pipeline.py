@@ -7,6 +7,7 @@ from mimir.audio.capture import AudioCaptureConfig, float_frames_to_pcm16, selec
 from mimir.audio.live import LiveAudioConfig, LiveAudioController, normalize_sources
 from mimir.audio.realtime import RealtimeAudioConfig, RealtimeAudioController
 from mimir.audio.vad import EnergyVadConfig, EnergyVadGate
+from mimir.dialogue import DialogueMemory, DialogueTurn
 from mimir.models import SpeechRecognitionResult
 
 
@@ -21,6 +22,7 @@ class FakeSession:
         self.transcripts: list[tuple[str, str, bool]] = []
         self.events: list[tuple[str, dict[str, object]]] = []
         self.metric_events: list[tuple[str, str, int | bool | None]] = []
+        self.memory = DialogueMemory()
 
     def start(self) -> dict[str, object]:
         self.started = True
@@ -34,6 +36,7 @@ class FakeSession:
         detect_question: bool = True,
     ) -> dict[str, object]:
         self.transcripts.append((source, text, is_final))
+        self.memory.append(DialogueTurn(source, text, is_final=is_final))
         return {"source": source, "text": text, "isFinal": is_final}
 
     def publish_status(self, event: str, payload: dict[str, object]) -> None:
@@ -47,6 +50,9 @@ class FakeSession:
 
     def record_stt_result(self, source: str, is_final: bool) -> None:
         self.metric_events.append(("stt", source, is_final))
+
+    def realtime_context(self, max_turns: int = 12, max_chars: int = 1800) -> str:
+        return self.memory.realtime_context(max_turns=max_turns, max_chars=max_chars)
 
 
 class FakePcmSource:
@@ -194,10 +200,10 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertIn(("stt", "remote", True), session.metric_events)
         self.assertTrue(any(event == "audio_status" for event, _payload in session.events))
 
-    def test_realtime_controller_sends_remote_audio_and_mic_context(self) -> None:
+    def test_realtime_controller_sends_remote_audio_and_dialogue_context(self) -> None:
         session = FakeSession()
         appended_audio: list[bytes] = []
-        mic_contexts: list[str] = []
+        dialogue_contexts: list[str] = []
         setup_calls: list[tuple[str, int]] = []
 
         class FakeRealtimeClient:
@@ -216,8 +222,8 @@ class AudioPipelineTests(unittest.TestCase):
             async def append_audio(self, pcm: bytes) -> None:
                 appended_audio.append(pcm)
 
-            async def add_mic_context(self, text: str) -> None:
-                mic_contexts.append(text)
+            async def add_dialogue_context(self, text: str) -> None:
+                dialogue_contexts.append(text)
 
             async def events(self) -> AsyncIterator[dict[str, object]]:
                 yield {
@@ -260,8 +266,12 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertFalse(controller.snapshot()["running"])
         self.assertTrue(session.started)
         self.assertEqual(setup_calls[0][1], 16_000)
+        self.assertIn("DIALOGUE_CONTEXT", setup_calls[0][0])
+        self.assertNotIn("MIC_CONTEXT", setup_calls[0][0])
         self.assertTrue(appended_audio)
-        self.assertEqual(mic_contexts, ["ru-RU:16000:2"])
+        self.assertTrue(dialogue_contexts)
+        self.assertIn("Собеседник: Как вы проектировали очередь задач?", "\n".join(dialogue_contexts))
+        self.assertIn("Пользователь: ru-RU:16000:2", "\n".join(dialogue_contexts))
         self.assertIn(("remote", "Как вы проектировали очередь задач?", True), session.transcripts)
         self.assertIn(("mic", "ru-RU:16000:2", True), session.transcripts)
         self.assertTrue(any(event[:2] == ("audio_chunk", "remote") for event in session.metric_events))
@@ -290,7 +300,7 @@ class AudioPipelineTests(unittest.TestCase):
             async def append_audio(self, pcm: bytes) -> None:
                 pass
 
-            async def add_mic_context(self, text: str) -> None:
+            async def add_dialogue_context(self, text: str) -> None:
                 pass
 
             async def events(self) -> AsyncIterator[dict[str, object]]:

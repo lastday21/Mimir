@@ -90,6 +90,28 @@ class DialogueMemory:
             confidence=confidence,
         )
 
+    def realtime_context(self, max_turns: int = 12, max_chars: int = 1800) -> str:
+        lines = [
+            format_turn(turn)
+            for turn in self.turns
+            if turn.is_final
+        ][-max_turns:]
+        if not lines:
+            return ""
+
+        selected: list[str] = []
+        current_len = 0
+        for line in reversed(lines):
+            extra = 1 if selected else 0
+            if not selected and len(line) > max_chars:
+                selected.append(line[:max_chars].rstrip())
+                break
+            if selected and current_len + extra + len(line) > max_chars:
+                break
+            selected.append(line)
+            current_len += extra + len(line)
+        return "\n".join(reversed(selected))
+
     def payload(self) -> dict[str, object]:
         return {
             "activeTopic": self.active_topic,

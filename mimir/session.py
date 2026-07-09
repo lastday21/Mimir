@@ -266,6 +266,12 @@ class SessionManager:
         with self._condition:
             return self.metrics_locked()
 
+    def realtime_context(self, max_turns: int = 12, max_chars: int = 1800) -> str:
+        with self._condition:
+            if self._state in {"paused", "stopped"}:
+                return ""
+            return self._memory.realtime_context(max_turns=max_turns, max_chars=max_chars)
+
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             return self.snapshot_locked()
