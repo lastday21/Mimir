@@ -20,6 +20,7 @@ class FakeSession:
         self.started = False
         self.transcripts: list[tuple[str, str, bool]] = []
         self.events: list[tuple[str, dict[str, object]]] = []
+        self.metric_events: list[tuple[str, str, int | bool | None]] = []
 
     def start(self) -> dict[str, object]:
         self.started = True
@@ -37,6 +38,15 @@ class FakeSession:
 
     def publish_status(self, event: str, payload: dict[str, object]) -> None:
         self.events.append((event, payload))
+
+    def record_audio_speech_started(self, source: str) -> None:
+        self.metric_events.append(("speech_started", source, None))
+
+    def record_audio_chunk(self, source: str, byte_count: int) -> None:
+        self.metric_events.append(("audio_chunk", source, byte_count))
+
+    def record_stt_result(self, source: str, is_final: bool) -> None:
+        self.metric_events.append(("stt", source, is_final))
 
 
 class FakePcmSource:
@@ -180,6 +190,8 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertFalse(controller.snapshot()["running"])
         self.assertTrue(session.started)
         self.assertEqual(session.transcripts, [("remote", "ru-RU:16000:2", True)])
+        self.assertTrue(any(event[:2] == ("audio_chunk", "remote") for event in session.metric_events))
+        self.assertIn(("stt", "remote", True), session.metric_events)
         self.assertTrue(any(event == "audio_status" for event, _payload in session.events))
 
     def test_realtime_controller_sends_remote_audio_and_mic_context(self) -> None:
@@ -252,6 +264,9 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertEqual(mic_contexts, ["ru-RU:16000:2"])
         self.assertIn(("remote", "Как вы проектировали очередь задач?", True), session.transcripts)
         self.assertIn(("mic", "ru-RU:16000:2", True), session.transcripts)
+        self.assertTrue(any(event[:2] == ("audio_chunk", "remote") for event in session.metric_events))
+        self.assertIn(("stt", "remote", True), session.metric_events)
+        self.assertIn(("stt", "mic", True), session.metric_events)
         self.assertTrue(any(event == "answer_delta" for event, _payload in session.events))
 
     def test_realtime_controller_reconnects_after_receive_error(self) -> None:

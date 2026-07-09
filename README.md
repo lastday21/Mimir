@@ -60,6 +60,12 @@ incoming Realtime events, answer deltas, and errors. It does not store API keys
 or raw audio bytes. Set `MIMIR_LIVE_TRACE=0` to disable it or
 `MIMIR_LIVE_TRACE_DIR=<path>` to write traces elsewhere.
 
+The same trace includes local latency metrics as `metric.stage` and
+`metric.question` events. Current in-memory metrics are also exposed at
+`GET /api/metrics/current`. The tracked timings include audio chunk readiness,
+STT interim/final text, question detection, context build, LLM first token,
+first visible hint, and answer completion.
+
 `POST /api/session/stt/wav` accepts a mono 16-bit PCM WAV file as a development
 feeder. It streams recognition results into the same session memory and question
 trigger path that live mic/loopback capture will use.

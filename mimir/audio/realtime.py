@@ -372,6 +372,7 @@ class RealtimeAudioController:
             for event in runner.run(MIC_SOURCE, chunks):
                 if stop_event.is_set():
                     return
+                self.record_stt_result(MIC_SOURCE, event.is_final)
                 self.session.ingest_transcript(MIC_SOURCE, event.text, is_final=event.is_final, detect_question=False)
                 if event.is_final and event.text.strip():
                     trace_live_event("audio.mic.context.enqueue", text=event.text)
@@ -411,10 +412,12 @@ class RealtimeAudioController:
                 if text:
                     trace_live_event("realtime.remote.transcript", text=text)
                     last_remote_text = text
+                    self.record_stt_result(REMOTE_SOURCE, True)
                     self.session.ingest_transcript(REMOTE_SOURCE, text, is_final=True, detect_question=False)
             elif event_type == "conversation.item.input_audio_transcription.delta":
                 delta = str(message.get("delta") or "").strip()
                 if delta:
+                    self.record_stt_result(REMOTE_SOURCE, False)
                     last_remote_text = f"{last_remote_text} {delta}".strip()
             elif event_type == "input_audio_buffer.speech_started":
                 self.publish("audio_status", {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "status": "speech"})
@@ -427,6 +430,7 @@ class RealtimeAudioController:
                 trace_live_event("realtime.answer.delta", delta=delta)
                 if not current_question_id:
                     current_question_id = self._publish_realtime_question(last_remote_text)
+                self.record_answer_first_hint(current_question_id, provider="yandex_realtime")
                 self.publish(
                     "answer_delta",
                     {
@@ -439,6 +443,7 @@ class RealtimeAudioController:
             elif event_type == "response.output_text.done":
                 if current_question_id:
                     trace_live_event("realtime.answer.done", questionId=current_question_id)
+                    self.record_answer_done(current_question_id)
                     self.publish("answer_done", {"questionId": current_question_id, "latencyMs": 0})
                     current_question_id = ""
             elif event_type == "error":
@@ -462,6 +467,7 @@ class RealtimeAudioController:
                 },
             },
         )
+        self.record_external_question(question_id, question, provider="yandex_realtime")
         return question_id
 
     def _source_reader(self, source: str, config: RealtimeAudioConfig) -> PcmSource:
@@ -485,6 +491,7 @@ class RealtimeAudioController:
             if stop_event.is_set():
                 return
             if not config.vad_enabled:
+                self.record_audio_chunk(source, len(chunk))
                 yield chunk
                 continue
 
@@ -502,9 +509,11 @@ class RealtimeAudioController:
                 last_level_at = now
             if decision.speech_started:
                 self.publish("audio_status", {"source": source, "mode": "yandex_realtime", "status": "speech"})
+                self.record_audio_speech_started(source)
             if decision.speech_ended:
                 self.publish("audio_status", {"source": source, "mode": "yandex_realtime", "status": "silence"})
             if decision.send_to_stt:
+                self.record_audio_chunk(source, len(chunk))
                 yield chunk
 
     def _finish_source(self, source: str) -> None:
@@ -527,6 +536,36 @@ class RealtimeAudioController:
 
     def publish(self, event: str, payload: dict[str, object]) -> None:
         self.session.publish_status(event, payload)
+
+    def record_audio_speech_started(self, source: str) -> None:
+        recorder = getattr(self.session, "record_audio_speech_started", None)
+        if callable(recorder):
+            recorder(source)
+
+    def record_audio_chunk(self, source: str, byte_count: int) -> None:
+        recorder = getattr(self.session, "record_audio_chunk", None)
+        if callable(recorder):
+            recorder(source, byte_count)
+
+    def record_stt_result(self, source: str, is_final: bool) -> None:
+        recorder = getattr(self.session, "record_stt_result", None)
+        if callable(recorder):
+            recorder(source, is_final)
+
+    def record_external_question(self, question_id: str, question: str, *, provider: str) -> None:
+        recorder = getattr(self.session, "record_external_question", None)
+        if callable(recorder):
+            recorder(question_id, question, provider=provider, source=REMOTE_SOURCE)
+
+    def record_answer_first_hint(self, question_id: str, *, provider: str) -> None:
+        recorder = getattr(self.session, "record_answer_first_hint", None)
+        if callable(recorder):
+            recorder(question_id, provider=provider)
+
+    def record_answer_done(self, question_id: str) -> None:
+        recorder = getattr(self.session, "record_answer_done", None)
+        if callable(recorder):
+            recorder(question_id)
 
     def _publish_error(self, source: str, error: str, *, running: bool, phase: str) -> None:
         with self._lock:

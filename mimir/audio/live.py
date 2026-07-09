@@ -196,6 +196,7 @@ class LiveAudioController:
             for event in runner.run(source, chunks):
                 if stop_event.is_set():
                     break
+                self.record_stt_result(event.source, event.is_final)
                 trace_live_event(
                     "speechkit.transcript",
                     source=event.source,
@@ -227,6 +228,7 @@ class LiveAudioController:
             if stop_event.is_set():
                 return
             if not config.vad_enabled:
+                self.record_audio_chunk(source, len(chunk))
                 yield chunk
                 continue
 
@@ -244,9 +246,11 @@ class LiveAudioController:
                 last_level_at = now
             if decision.speech_started:
                 self.publish("audio_status", {"source": source, "status": "speech"})
+                self.record_audio_speech_started(source)
             if decision.speech_ended:
                 self.publish("audio_status", {"source": source, "status": "silence"})
             if decision.send_to_stt:
+                self.record_audio_chunk(source, len(chunk))
                 yield chunk
 
     def _finish_source(self, source: str) -> None:
@@ -263,6 +267,21 @@ class LiveAudioController:
 
     def publish(self, event: str, payload: dict[str, object]) -> None:
         self.session.publish_status(event, payload)
+
+    def record_audio_speech_started(self, source: str) -> None:
+        recorder = getattr(self.session, "record_audio_speech_started", None)
+        if callable(recorder):
+            recorder(source)
+
+    def record_audio_chunk(self, source: str, byte_count: int) -> None:
+        recorder = getattr(self.session, "record_audio_chunk", None)
+        if callable(recorder):
+            recorder(source, byte_count)
+
+    def record_stt_result(self, source: str, is_final: bool) -> None:
+        recorder = getattr(self.session, "record_stt_result", None)
+        if callable(recorder):
+            recorder(source, is_final)
 
 
 def default_source_factory(source: str, config: AudioCaptureConfig) -> SoundcardPcmSource:

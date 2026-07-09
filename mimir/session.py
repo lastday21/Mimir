@@ -39,6 +39,12 @@ class SessionManager:
         self._last_question_key = ""
         self._last_question_at = 0.0
         self._metrics: dict[str, Any] = {}
+        self._source_metrics: dict[str, dict[str, Any]] = {}
+        self._question_metrics: list[dict[str, Any]] = []
+        self._question_metric_by_id: dict[str, dict[str, Any]] = {}
+        self._question_runtime: dict[str, dict[str, float]] = {}
+        self._active_question_id = ""
+        self._cancelled_streams = 0
         self._generation = 0
 
     def start(self) -> dict[str, Any]:
@@ -51,7 +57,7 @@ class SessionManager:
             self._cancel_answer = threading.Event()
             self._last_question_key = ""
             self._last_question_at = 0.0
-            self._metrics = {}
+            self.reset_metrics_locked()
             self._state = "listening"
             payload = self.snapshot_locked()
             self.publish_locked("session_state", payload)
@@ -77,7 +83,7 @@ class SessionManager:
             self._memory = DialogueMemory()
             self._last_question_key = ""
             self._last_question_at = 0.0
-            self._metrics = {}
+            self.reset_metrics_locked()
             self._state = "paused"
             payload = self.snapshot_locked()
             self.publish_locked("session_state", payload)
@@ -132,9 +138,133 @@ class SessionManager:
     def publish_status(self, event: str, payload: dict[str, Any]) -> None:
         self._publish(event, payload)
 
+    def record_audio_speech_started(self, source: str) -> None:
+        source = normalize_source(source)
+        now = time.monotonic()
+        now_ms = wall_ms()
+        with self._condition:
+            if self._state in {"paused", "stopped"}:
+                return
+            metric = {
+                "source": source,
+                "speechStartedAtMs": now_ms,
+                "_speechStartedAt": now,
+            }
+            self._source_metrics[source] = metric
+            self.trace_metric_stage_locked(source=source, stage="speech_started", elapsed_ms=0)
+
+    def record_audio_chunk(self, source: str, byte_count: int) -> None:
+        source = normalize_source(source)
+        now = time.monotonic()
+        now_ms = wall_ms()
+        with self._condition:
+            if self._state in {"paused", "stopped"}:
+                return
+            metric = self._source_metrics.setdefault(
+                source,
+                {
+                    "source": source,
+                    "speechStartedAtMs": now_ms,
+                    "_speechStartedAt": now,
+                },
+            )
+            if "audioChunkAtMs" in metric:
+                return
+            started = float(metric.get("_speechStartedAt", now))
+            elapsed = elapsed_ms(started, now)
+            metric["audioChunkAtMs"] = now_ms
+            metric["_audioChunkAt"] = now
+            metric["audioChunkBytes"] = byte_count
+            metric["tAudioChunkMs"] = elapsed
+            self.trace_metric_stage_locked(source=source, stage="audio_chunk", elapsed_ms=elapsed, bytes=byte_count)
+
+    def record_stt_result(self, source: str, is_final: bool) -> None:
+        source = normalize_source(source)
+        now = time.monotonic()
+        now_ms = wall_ms()
+        with self._condition:
+            if self._state in {"paused", "stopped"}:
+                return
+            metric = self._source_metrics.setdefault(
+                source,
+                {
+                    "source": source,
+                    "speechStartedAtMs": now_ms,
+                    "_speechStartedAt": now,
+                    "audioChunkAtMs": now_ms,
+                    "_audioChunkAt": now,
+                    "tAudioChunkMs": 0,
+                },
+            )
+            audio_at = float(metric.get("_audioChunkAt", now))
+            if not is_final and "tSttInterimMs" not in metric:
+                elapsed = elapsed_ms(audio_at, now)
+                metric["sttInterimAtMs"] = now_ms
+                metric["tSttInterimMs"] = elapsed
+                self.trace_metric_stage_locked(source=source, stage="stt_interim", elapsed_ms=elapsed)
+                return
+            if is_final:
+                elapsed = elapsed_ms(audio_at, now)
+                metric["sttFinalAtMs"] = now_ms
+                metric["_sttFinalAt"] = now
+                metric["tSttFinalMs"] = elapsed
+                self.trace_metric_stage_locked(source=source, stage="stt_final", elapsed_ms=elapsed)
+
+    def record_external_question(
+        self,
+        question_id: str,
+        question: str,
+        *,
+        confidence: float = 1.0,
+        provider: str = "external",
+        source: str = REMOTE_SOURCE,
+    ) -> None:
+        source = normalize_source(source)
+        now = time.monotonic()
+        with self._condition:
+            if self._state in {"paused", "stopped"}:
+                return
+            metric = self.build_question_metric_locked(
+                question_id=question_id,
+                question=question,
+                confidence=confidence,
+                reason=provider,
+                source=source,
+                detected_started=now,
+                detected_done=now,
+                context_started=now,
+                context_done=now,
+                provider=provider,
+            )
+            self.add_question_metric_locked(metric, question_ready_at=now)
+
+    def record_answer_first_hint(self, question_id: str, *, provider: str | None = None) -> None:
+        now = time.monotonic()
+        with self._condition:
+            metric = self._question_metric_by_id.get(question_id)
+            runtime = self._question_runtime.get(question_id)
+            if metric is None or runtime is None or "tFirstHintMs" in metric:
+                return
+            metric["firstHintAtMs"] = wall_ms()
+            metric["tFirstHintMs"] = elapsed_ms(runtime["questionReadyAt"], now)
+            if provider:
+                metric["provider"] = provider
+            self.trace_question_metric_locked(metric)
+
+    def record_answer_done(self, question_id: str) -> None:
+        now = time.monotonic()
+        with self._condition:
+            metric = self._question_metric_by_id.get(question_id)
+            runtime = self._question_runtime.get(question_id)
+            if metric is None or runtime is None:
+                return
+            metric["answerDoneAtMs"] = wall_ms()
+            metric["tAnswerDoneMs"] = elapsed_ms(runtime["questionReadyAt"], now)
+            self.trace_question_metric_locked(metric)
+
     def metrics(self) -> dict[str, Any]:
         with self._condition:
-            return dict(self._metrics)
+            return self.metrics_locked()
 
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
@@ -158,15 +288,32 @@ class SessionManager:
             yield event
 
     def _maybe_trigger_question(self, text: str, timestamp_ms: int) -> None:
+        detected_started = time.monotonic()
         questions = detect_questions(text, timestamp_ms=timestamp_ms, source=REMOTE_SOURCE)
+        detected_done = time.monotonic()
         if not questions:
             return
         best = max(questions, key=lambda item: item.confidence)
-        self.trigger_question(best.text, confidence=best.confidence, reason="auto")
+        self.trigger_question(
+            best.text,
+            confidence=best.confidence,
+            reason="auto",
+            detected_started=detected_started,
+            detected_done=detected_done,
+        )
 
-    def trigger_question(self, question: str, confidence: float, reason: str) -> dict[str, Any]:
+    def trigger_question(
+        self,
+        question: str,
+        confidence: float,
+        reason: str,
+        detected_started: float | None = None,
+        detected_done: float | None = None,
+    ) -> dict[str, Any]:
         key = normalize_question_key(question)
         now = time.monotonic()
+        detect_started_at = detected_started if detected_started is not None else now
+        detect_done_at = detected_done if detected_done is not None else now
         with self._condition:
             if key and key == self._last_question_key and now - self._last_question_at < 8:
                 return {
@@ -178,8 +325,25 @@ class SessionManager:
             question_id = new_id("question")
             self._last_question_key = key
             self._last_question_at = now
+            if self._state == "answering":
+                self._cancelled_streams += 1
             self._memory.remember_question(question)
+            context_started = time.monotonic()
             context = self._memory.build_context(self._session_id, question_id, question, confidence)
+            context_done = time.monotonic()
+            metric = self.build_question_metric_locked(
+                question_id=question_id,
+                question=question,
+                confidence=confidence,
+                reason=reason,
+                source=REMOTE_SOURCE,
+                detected_started=detect_started_at,
+                detected_done=detect_done_at,
+                context_started=context_started,
+                context_done=context_done,
+                provider=self.provider_name(),
+            )
+            self.add_question_metric_locked(metric, question_ready_at=detect_done_at)
             payload = {
                 "sessionId": self._session_id,
                 "questionId": question_id,
@@ -203,6 +367,7 @@ class SessionManager:
             self._cancel_answer = threading.Event()
             cancel = self._cancel_answer
             self._state = "answering"
+            self._active_question_id = question_id
             self.publish_locked("session_state", self.snapshot_locked())
             generation = self._generation
 
@@ -241,6 +406,14 @@ class SessionManager:
                 if first_delta_at is None:
                     first_delta_at = time.monotonic()
                     self._record_metric_if_current(generation, "llmTtfbMs", elapsed_ms(started, first_delta_at))
+                    self._record_question_field_if_current(
+                        generation,
+                        question_id,
+                        "tLlmTtfbMs",
+                        elapsed_ms(started, first_delta_at),
+                    )
+                    self._record_question_field_if_current(generation, question_id, "provider", self.provider_name())
+                    self.record_answer_first_hint(question_id)
                 self._publish_if_current(
                     generation,
                     "answer_delta",
@@ -256,6 +429,7 @@ class SessionManager:
                 "answer_done",
                 {"questionId": question_id, "latencyMs": elapsed_ms(started, time.monotonic())},
             )
+            self.record_answer_done(question_id)
         except ProviderError as error:
             self._publish_if_current(generation, "answer_error", {"questionId": question_id, "error": str(error)})
             with self._condition:
@@ -300,16 +474,121 @@ class SessionManager:
             self._metrics[key] = value
             self._metrics["updatedAt"] = int(time.time() * 1000)
 
+    def _record_question_field_if_current(self, generation: int, question_id: str, key: str, value: Any) -> None:
+        with self._condition:
+            if generation != self._generation:
+                return
+            metric = self._question_metric_by_id.get(question_id)
+            if metric is not None:
+                metric[key] = value
+
     def _generation_matches(self, generation: int) -> bool:
         with self._condition:
             return generation == self._generation
+
+    def reset_metrics_locked(self) -> None:
+        self._metrics = {}
+        self._source_metrics = {}
+        self._question_metrics = []
+        self._question_metric_by_id = {}
+        self._question_runtime = {}
+        self._active_question_id = ""
+        self._cancelled_streams = 0
+
+    def metrics_locked(self) -> dict[str, Any]:
+        payload = dict(self._metrics)
+        payload["sources"] = {
+            source: public_metric(metric)
+            for source, metric in self._source_metrics.items()
+        }
+        payload["questions"] = [public_metric(metric) for metric in self._question_metrics[-20:]]
+        payload["currentQuestionId"] = self._active_question_id
+        payload["cancelledStreams"] = self._cancelled_streams
+        return payload
+
+    def build_question_metric_locked(
+        self,
+        *,
+        question_id: str,
+        question: str,
+        confidence: float,
+        reason: str,
+        source: str,
+        detected_started: float,
+        detected_done: float,
+        context_started: float,
+        context_done: float,
+        provider: str,
+    ) -> dict[str, Any]:
+        source_metric = self._source_metrics.get(source, {})
+        metric = {
+            "sessionId": self._session_id,
+            "questionId": question_id,
+            "source": source,
+            "reason": reason,
+            "provider": provider,
+            "fallbackUsed": False,
+            "questionConfidence": confidence,
+            "contextConfidence": confidence,
+            "cancelledStreams": self._cancelled_streams,
+            "createdAtMs": wall_ms(),
+            "tDetectMs": elapsed_ms(detected_started, detected_done),
+            "tContextBuildMs": elapsed_ms(context_started, context_done),
+        }
+        for source_key, target_key in (
+            ("tAudioChunkMs", "tAudioChunkMs"),
+            ("tSttInterimMs", "tSttInterimMs"),
+            ("tSttFinalMs", "tSttFinalMs"),
+        ):
+            if source_key in source_metric:
+                metric[target_key] = source_metric[source_key]
+        return metric
+
+    def add_question_metric_locked(self, metric: dict[str, Any], *, question_ready_at: float) -> None:
+        question_id = str(metric["questionId"])
+        self._question_metrics.append(metric)
+        self._question_metrics = self._question_metrics[-50:]
+        self._question_metric_by_id[question_id] = metric
+        self._question_runtime[question_id] = {"questionReadyAt": question_ready_at}
+        self._active_question_id = question_id
+        self.trace_metric_stage_locked(
+            source=str(metric["source"]),
+            stage="question_detected",
+            elapsed_ms=int(metric.get("tDetectMs", 0)),
+            questionId=question_id,
+        )
+        self.trace_metric_stage_locked(
+            source=str(metric["source"]),
+            stage="context_built",
+            elapsed_ms=int(metric.get("tContextBuildMs", 0)),
+            questionId=question_id,
+        )
+
+    def trace_metric_stage_locked(self, *, source: str, stage: str, elapsed_ms: int, **payload: Any) -> None:
+        trace_live_event(
+            "metric.stage",
+            sessionId=self._session_id,
+            source=source,
+            stage=stage,
+            elapsedMs=elapsed_ms,
+            **payload,
+        )
+
+    def trace_question_metric_locked(self, metric: dict[str, Any]) -> None:
+        trace_live_event("metric.question", **public_metric(metric))
+
+    def provider_name(self) -> str:
+        try:
+            return load_config().llm_provider
+        except Exception:
+            return "unknown"
 
     def snapshot_locked(self) -> dict[str, Any]:
         return {
             "sessionId": self._session_id,
             "state": self._state,
             "memory": self._memory.payload(),
-            "metrics": dict(self._metrics),
+            "metrics": self.metrics_locked(),
         }
 
     def publish_locked(self, event: str, payload: dict[str, Any]) -> None:
@@ -345,6 +624,14 @@ def new_id(prefix: str) -> str:
 
 def elapsed_ms(started: float, ended: float) -> int:
     return int((ended - started) * 1000)
+
+
+def wall_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def public_metric(metric: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metric.items() if not key.startswith("_")}
 
 
 def sse_payload(event: SessionEvent) -> bytes:

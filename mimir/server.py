@@ -449,7 +449,10 @@ def run_wav_stt_job(job_id: str, source: str, language: str, chunk_duration_ms: 
             },
         )
         runner = SpeechKitStreamRunner(YandexSpeechKitClient(key), config)
+        SESSION_MANAGER.record_audio_speech_started(source)
+        SESSION_MANAGER.record_audio_chunk(source, len(data))
         for event in runner.run(source, chunks):
+            SESSION_MANAGER.record_stt_result(event.source, event.is_final)
             SESSION_MANAGER.ingest_transcript(event.source, event.text, is_final=event.is_final)
         SESSION_MANAGER.publish_status(
             "stt_status",
