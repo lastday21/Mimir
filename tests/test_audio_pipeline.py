@@ -5,7 +5,7 @@ from collections.abc import Iterable, Iterator
 
 from mimir.audio.capture import AudioCaptureConfig, float_frames_to_pcm16, select_loopback, select_microphone
 from mimir.audio.live import LiveAudioConfig, LiveAudioController, normalize_sources
-from mimir.audio.realtime import RealtimeAudioConfig, RealtimeAudioController
+from mimir.audio.realtime import REALTIME_INSTRUCTIONS, RealtimeAudioConfig, RealtimeAudioController
 from mimir.audio.vad import EnergyVadConfig, EnergyVadGate
 from mimir.dialogue import DialogueMemory, DialogueTurn
 from mimir.models import SpeechRecognitionResult
@@ -165,6 +165,13 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertTrue(tail.send_to_stt)
         self.assertTrue(ended.speech_ended)
         self.assertFalse(ended.send_to_stt)
+
+    def test_realtime_prompt_keeps_context_contract_without_language_rule(self) -> None:
+        self.assertIn("DIALOGUE_CONTEXT", REALTIME_INSTRUCTIONS)
+        self.assertIn("не участник созвона", REALTIME_INSTRUCTIONS)
+        self.assertIn("Не выдумывай опыт", REALTIME_INSTRUCTIONS)
+        self.assertNotIn("на языке вопроса", REALTIME_INSTRUCTIONS)
+        self.assertNotIn("пиши по-русски", REALTIME_INSTRUCTIONS)
 
     def test_live_controller_streams_vad_chunks_into_session(self) -> None:
         session = FakeSession()
