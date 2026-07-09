@@ -142,6 +142,12 @@ export function stopSession(): Promise<SessionSnapshot> {
   });
 }
 
+export function pauseSession(): Promise<SessionSnapshot> {
+  return request<SessionSnapshot>("/api/session/pause", {
+    method: "POST"
+  });
+}
+
 export function startLiveAudio(
   sources: Array<"remote" | "mic">,
   deviceIds: Partial<Record<"remote" | "mic", string>> = {},

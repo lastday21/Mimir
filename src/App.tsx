@@ -11,6 +11,7 @@ import {
   getConfig,
   listAudioDevices,
   listModels,
+  pauseSession,
   preflightLiveAudio,
   saveConfig,
   sendTranscript,
@@ -184,6 +185,7 @@ export function App() {
   const providerIcon = useMemo(() => {
     return config.llmProvider === "ollama" ? <Server size={18} /> : <Cloud size={18} />;
   }, [config.llmProvider]);
+  const canPauseSession = session?.state === "listening" || session?.state === "answering" || session?.state === "degraded";
 
   async function persist(nextConfig = config) {
     const saved = await saveConfig(nextConfig);
@@ -257,6 +259,25 @@ export function App() {
     }
   }
 
+  async function handlePauseSession() {
+    setBusy(true);
+    try {
+      const snapshot = await pauseSession();
+      setSession(snapshot);
+      setAudioRunning(false);
+      setAudioLevels(emptyAudioLevels());
+      setTurns([]);
+      setQuestions([]);
+      setCurrentQuestion("");
+      setAnswer("");
+      setStatus("Session paused");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to pause session");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleStartLiveAudio() {
     const sources: AudioSource[] = [];
     if (liveRemote) sources.push("remote");
@@ -297,7 +318,7 @@ export function App() {
 
   async function handleToggleLiveAudio() {
     if (audioRunning) {
-      await handleStopLiveAudio();
+      await handlePauseSession();
       return;
     }
     await handleStartLiveAudio();
@@ -442,6 +463,10 @@ export function App() {
           <button className="danger" onClick={handleStopSession} disabled={busy || !session || session.state === "stopped"}>
             <Square size={16} />
             Stop
+          </button>
+          <button onClick={handlePauseSession} disabled={busy || !canPauseSession}>
+            <Pause size={16} />
+            Pause
           </button>
           <span className="session-state">{session?.state ?? "idle"}</span>
           <span className="session-id">{session?.sessionId ?? "no session"}</span>

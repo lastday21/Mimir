@@ -73,6 +73,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(SESSION_MANAGER.start())
             elif parsed.path == "/api/session/stop":
                 self.handle_session_stop()
+            elif parsed.path == "/api/session/pause":
+                self.handle_session_pause()
             elif parsed.path == "/api/session/audio/preflight":
                 self.handle_live_audio_preflight()
             elif parsed.path == "/api/session/audio/start":
@@ -135,6 +137,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         LIVE_AUDIO.stop()
         REALTIME_AUDIO.stop()
         self.send_json(SESSION_MANAGER.stop())
+
+    def handle_session_pause(self) -> None:
+        LIVE_AUDIO.stop()
+        REALTIME_AUDIO.stop()
+        self.send_json(SESSION_MANAGER.pause())
 
     def handle_live_audio_preflight(self) -> None:
         self.send_json(build_live_audio_preflight(self.read_json()))

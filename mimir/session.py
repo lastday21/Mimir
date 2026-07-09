@@ -39,14 +39,19 @@ class SessionManager:
         self._last_question_key = ""
         self._last_question_at = 0.0
         self._metrics: dict[str, Any] = {}
+        self._generation = 0
 
     def start(self) -> dict[str, Any]:
         with self._condition:
             if self._state in {"listening", "answering"}:
                 return self.snapshot_locked()
+            self._generation += 1
             self._session_id = new_id("session")
             self._memory = DialogueMemory()
             self._cancel_answer = threading.Event()
+            self._last_question_key = ""
+            self._last_question_at = 0.0
+            self._metrics = {}
             self._state = "listening"
             payload = self.snapshot_locked()
             self.publish_locked("session_state", payload)
@@ -56,10 +61,27 @@ class SessionManager:
     def stop(self) -> dict[str, Any]:
         self._cancel_answer.set()
         with self._condition:
+            self._generation += 1
             self._state = "stopped"
             payload = self.snapshot_locked()
             self.publish_locked("session_state", payload)
             trace_live_event("session.stop", sessionId=self._session_id, state=self._state)
+            return payload
+
+    def pause(self) -> dict[str, Any]:
+        self._cancel_answer.set()
+        with self._condition:
+            if self._state not in {"listening", "answering", "degraded"}:
+                return self.snapshot_locked()
+            self._generation += 1
+            self._memory = DialogueMemory()
+            self._last_question_key = ""
+            self._last_question_at = 0.0
+            self._metrics = {}
+            self._state = "paused"
+            payload = self.snapshot_locked()
+            self.publish_locked("session_state", payload)
+            trace_live_event("session.pause", sessionId=self._session_id, state=self._state)
             return payload
 
     def ingest_transcript(
@@ -72,6 +94,16 @@ class SessionManager:
         source = normalize_source(source)
         turn = DialogueTurn(source=source, text=text, is_final=is_final)
         with self._condition:
+            if self._state in {"paused", "stopped"}:
+                return {
+                    "sessionId": self._session_id,
+                    "source": turn.source,
+                    "text": turn.text,
+                    "isFinal": turn.is_final,
+                    "timestampMs": turn.timestamp_ms,
+                    "skipped": True,
+                    "reason": self._state,
+                }
             if self._state == "idle":
                 self._state = "listening"
                 self.publish_locked("session_state", self.snapshot_locked())
@@ -172,10 +204,11 @@ class SessionManager:
             cancel = self._cancel_answer
             self._state = "answering"
             self.publish_locked("session_state", self.snapshot_locked())
+            generation = self._generation
 
         thread = threading.Thread(
             target=self._run_answer,
-            args=(question_id, question, confidence, cancel),
+            args=(question_id, question, confidence, cancel, generation),
             name=f"mimir-answer-{question_id}",
             daemon=True,
         )
@@ -183,23 +216,33 @@ class SessionManager:
         thread.start()
         return payload
 
-    def _run_answer(self, question_id: str, question: str, confidence: float, cancel: threading.Event) -> None:
+    def _run_answer(
+        self,
+        question_id: str,
+        question: str,
+        confidence: float,
+        cancel: threading.Event,
+        generation: int,
+    ) -> None:
         started = time.monotonic()
         first_delta_at: float | None = None
         try:
             with self._condition:
+                if generation != self._generation:
+                    return
                 context = self._memory.build_context(self._session_id, question_id, question, confidence)
             messages = build_realtime_messages(question, context.to_prompt_text())
             for chunk in self._stream_answer(messages):
-                if cancel.is_set():
-                    self._publish("answer_cancelled", {"questionId": question_id})
+                if cancel.is_set() or not self._generation_matches(generation):
+                    self._publish_if_current(generation, "answer_cancelled", {"questionId": question_id})
                     return
                 if not chunk:
                     continue
                 if first_delta_at is None:
                     first_delta_at = time.monotonic()
-                    self._record_metric("llmTtfbMs", elapsed_ms(started, first_delta_at))
-                self._publish(
+                    self._record_metric_if_current(generation, "llmTtfbMs", elapsed_ms(started, first_delta_at))
+                self._publish_if_current(
+                    generation,
                     "answer_delta",
                     {
                         "questionId": question_id,
@@ -208,17 +251,22 @@ class SessionManager:
                         "latencyMs": elapsed_ms(started, time.monotonic()),
                     },
                 )
-            self._publish("answer_done", {"questionId": question_id, "latencyMs": elapsed_ms(started, time.monotonic())})
+            self._publish_if_current(
+                generation,
+                "answer_done",
+                {"questionId": question_id, "latencyMs": elapsed_ms(started, time.monotonic())},
+            )
         except ProviderError as error:
-            self._publish("answer_error", {"questionId": question_id, "error": str(error)})
+            self._publish_if_current(generation, "answer_error", {"questionId": question_id, "error": str(error)})
             with self._condition:
-                self._state = "degraded"
-                self.publish_locked("session_state", self.snapshot_locked())
+                if generation == self._generation:
+                    self._state = "degraded"
+                    self.publish_locked("session_state", self.snapshot_locked())
             return
         finally:
             if not cancel.is_set():
                 with self._condition:
-                    if self._state == "answering":
+                    if generation == self._generation and self._state == "answering":
                         self._state = "listening"
                         self.publish_locked("session_state", self.snapshot_locked())
 
@@ -234,10 +282,27 @@ class SessionManager:
         with self._condition:
             self.publish_locked(event, {"sessionId": self._session_id, **payload})
 
+    def _publish_if_current(self, generation: int, event: str, payload: dict[str, Any]) -> None:
+        with self._condition:
+            if generation != self._generation:
+                return
+            self.publish_locked(event, {"sessionId": self._session_id, **payload})
+
     def _record_metric(self, key: str, value: Any) -> None:
         with self._condition:
             self._metrics[key] = value
             self._metrics["updatedAt"] = int(time.time() * 1000)
+
+    def _record_metric_if_current(self, generation: int, key: str, value: Any) -> None:
+        with self._condition:
+            if generation != self._generation:
+                return
+            self._metrics[key] = value
+            self._metrics["updatedAt"] = int(time.time() * 1000)
+
+    def _generation_matches(self, generation: int) -> bool:
+        with self._condition:
+            return generation == self._generation
 
     def snapshot_locked(self) -> dict[str, Any]:
         return {
