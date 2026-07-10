@@ -62,6 +62,12 @@ API cannot be used.
 `/api/session/transcript` remains a development input for direct transcript
 injection.
 
+Transcript events keep a stable `turnId`: interim updates replace the current
+turn, and the final or normalized result replaces that same turn instead of
+creating duplicates. Session memory retains the full five-minute dialogue
+window and exposes linked question, Mimir hint, and user-answer exchanges for
+follow-up context.
+
 SpeechKit streaming uses direct SpeechKit v3 gRPC through the generated stubs
 from the `yandexcloud` package. Realtime mode uses `aiohttp` WebSocket transport
 with the `speech-realtime-250923` model.

@@ -112,6 +112,7 @@ class SessionManager:
         text: str,
         is_final: bool = True,
         detect_question: bool = True,
+        is_refinement: bool = False,
     ) -> dict[str, Any]:
         source = normalize_source(source)
         turn = DialogueTurn(source=source, text=text, is_final=is_final)
@@ -129,13 +130,29 @@ class SessionManager:
             if self._state == "idle":
                 self._state = "listening"
                 self.publish_locked("session_state", self.snapshot_locked())
-            self._memory.append(turn)
+            update = self._memory.append(turn, refine_latest=is_refinement)
+            if update is None:
+                return {
+                    "sessionId": self._session_id,
+                    "source": turn.source,
+                    "text": turn.text,
+                    "isFinal": turn.is_final,
+                    "timestampMs": turn.timestamp_ms,
+                    "skipped": True,
+                    "reason": "empty",
+                }
+            turn = update.turn
+            if turn.source == MIC_SOURCE and turn.is_final:
+                self._memory.record_user_answer(self._active_question_id, turn)
             payload = {
                 "sessionId": self._session_id,
+                "turnId": turn.turn_id,
                 "source": turn.source,
                 "text": turn.text,
                 "isFinal": turn.is_final,
                 "timestampMs": turn.timestamp_ms,
+                "operation": update.operation,
+                "memoryWindowMs": self._memory.retention_ms,
             }
             self.publish_locked("transcript", payload)
             trace_live_event(
@@ -143,11 +160,13 @@ class SessionManager:
                 source=turn.source,
                 text=turn.text,
                 isFinal=turn.is_final,
+                operation=update.operation,
+                isRefinement=is_refinement,
                 detectQuestion=detect_question,
                 timestampMs=turn.timestamp_ms,
             )
 
-        if detect_question and turn.source == REMOTE_SOURCE and turn.is_final:
+        if detect_question and turn.source == REMOTE_SOURCE and turn.is_final and not is_refinement:
             self._maybe_trigger_question(turn.text, turn.timestamp_ms)
         return payload
 
@@ -276,13 +295,17 @@ class SessionManager:
                 provider=provider,
             )
             self.add_question_metric_locked(metric, question_ready_at=now)
+            self._memory.remember_question(question_id, question, wall_ms())
             self._current_question = {
                 "sessionId": self._session_id,
                 "questionId": question_id,
                 "question": question,
                 "confidence": confidence,
                 "reason": provider,
-                "context": {"activeTopic": self._memory.active_topic, "priorQuestions": self._memory.recent_questions()},
+                "context": {
+                    "activeTopic": self._memory.active_topic,
+                    "priorQuestions": self._memory.recent_questions(exclude_id=question_id),
+                },
             }
             self._current_answer_text = ""
 
@@ -293,6 +316,7 @@ class SessionManager:
             if question_id != self._active_question_id:
                 return
             self._current_answer_text += text
+            self._memory.record_hint_delta(question_id, text, wall_ms())
 
     def record_answer_first_hint(self, question_id: str, *, provider: str | None = None) -> None:
         now = time.monotonic()
@@ -362,6 +386,7 @@ class SessionManager:
             reason="auto",
             detected_started=detected_started,
             detected_done=detected_done,
+            question_timestamp_ms=timestamp_ms,
         )
 
     def trigger_question(
@@ -371,6 +396,7 @@ class SessionManager:
         reason: str,
         detected_started: float | None = None,
         detected_done: float | None = None,
+        question_timestamp_ms: int | None = None,
     ) -> dict[str, Any]:
         key = normalize_question_key(question)
         now = time.monotonic()
@@ -389,7 +415,7 @@ class SessionManager:
             self._last_question_at = now
             if self._state == "answering":
                 self._cancelled_streams += 1
-            self._memory.remember_question(question)
+            self._memory.remember_question(question_id, question, question_timestamp_ms)
             context_started = time.monotonic()
             context = self._memory.build_context(self._session_id, question_id, question, confidence)
             context_done = time.monotonic()

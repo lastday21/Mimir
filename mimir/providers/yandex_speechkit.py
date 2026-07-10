@@ -190,7 +190,12 @@ def parse_streaming_response(response: object) -> SpeechRecognitionResult | None
     if event == "final_refinement":
         text = text_from_update(response.final_refinement.normalized_text)
         if text:
-            return SpeechRecognitionResult(text=text, is_final=True, end_of_utterance=True)
+            return SpeechRecognitionResult(
+                text=text,
+                is_final=True,
+                end_of_utterance=True,
+                is_refinement=True,
+            )
     if event == "status_code":
         code_type = getattr(response.status_code, "code_type", 0)
         message = getattr(response.status_code, "message", "")

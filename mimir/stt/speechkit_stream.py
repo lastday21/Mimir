@@ -28,6 +28,7 @@ class TranscriptEvent:
     end_of_utterance: bool
     timestamp_ms: int
     confidence: float | None = None
+    is_refinement: bool = False
 
 
 class StreamingRecognizer(Protocol):
@@ -61,6 +62,7 @@ class SpeechKitStreamRunner:
                     end_of_utterance=result.end_of_utterance,
                     timestamp_ms=int(time.time() * 1000),
                     confidence=result.confidence,
+                    is_refinement=result.is_refinement,
                 )
 
 

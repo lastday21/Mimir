@@ -179,7 +179,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         source = str(payload.get("source") or "")
         text = str(payload.get("text") or "")
         is_final = bool(payload.get("isFinal", True))
-        self.send_json(SESSION_MANAGER.ingest_transcript(source, text, is_final=is_final))
+        is_refinement = bool(payload.get("isRefinement", False))
+        self.send_json(
+            SESSION_MANAGER.ingest_transcript(
+                source,
+                text,
+                is_final=is_final,
+                is_refinement=is_refinement,
+            )
+        )
 
     def handle_session_stt_wav(self, query: str) -> None:
         params = parse_qs(query)
@@ -655,7 +663,12 @@ def run_wav_stt_job(job_id: str, source: str, language: str, chunk_duration_ms: 
         SESSION_MANAGER.record_audio_chunk(source, len(data))
         for event in runner.run(source, chunks):
             SESSION_MANAGER.record_stt_result(event.source, event.is_final)
-            SESSION_MANAGER.ingest_transcript(event.source, event.text, is_final=event.is_final)
+            SESSION_MANAGER.ingest_transcript(
+                event.source,
+                event.text,
+                is_final=event.is_final,
+                is_refinement=event.is_refinement,
+            )
         SESSION_MANAGER.publish_status(
             "stt_status",
             {"jobId": job_id, "source": source, "status": "done"},

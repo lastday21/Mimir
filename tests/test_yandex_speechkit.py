@@ -57,6 +57,23 @@ class YandexSpeechKitTests(unittest.TestCase):
         self.assertEqual(result.text, "готово")
         self.assertTrue(result.is_final)
 
+    def test_marks_normalized_final_as_refinement(self) -> None:
+        response = stt_pb2.StreamingResponse(
+            final_refinement=stt_pb2.FinalRefinement(
+                final_index=0,
+                normalized_text=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="Я закончил проект")]
+                ),
+            )
+        )
+
+        result = parse_streaming_response(response)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.is_final)
+        self.assertTrue(result.is_refinement)
+        self.assertEqual(result.text, "Я закончил проект")
+
 
 if __name__ == "__main__":
     unittest.main()

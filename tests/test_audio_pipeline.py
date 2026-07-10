@@ -36,9 +36,10 @@ class FakeSession:
         text: str,
         is_final: bool = True,
         detect_question: bool = True,
+        is_refinement: bool = False,
     ) -> dict[str, object]:
         self.transcripts.append((source, text, is_final))
-        self.memory.append(DialogueTurn(source, text, is_final=is_final))
+        self.memory.append(DialogueTurn(source, text, is_final=is_final), refine_latest=is_refinement)
         return {"source": source, "text": text, "isFinal": is_final}
 
     def publish_status(self, event: str, payload: dict[str, object]) -> None:

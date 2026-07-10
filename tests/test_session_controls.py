@@ -8,6 +8,39 @@ from mimir.session import SessionManager
 
 
 class SessionControlTests(unittest.TestCase):
+    def test_final_transcript_replaces_interim_in_event_and_snapshot(self) -> None:
+        manager = SessionManager()
+        manager.start()
+
+        interim = manager.ingest_transcript("remote", "Как вы", is_final=False, detect_question=False)
+        final = manager.ingest_transcript("remote", "Как вы строили сервис?", detect_question=False)
+        snapshot = manager.snapshot()
+
+        self.assertEqual(interim["operation"], "append")
+        self.assertEqual(final["operation"], "replace")
+        self.assertEqual(final["turnId"], interim["turnId"])
+        self.assertEqual(len(snapshot["memory"]["turns"]), 1)
+        self.assertEqual(snapshot["memory"]["turns"][0]["text"], "Как вы строили сервис?")
+        self.assertTrue(snapshot["memory"]["turns"][0]["isFinal"])
+
+    def test_session_links_question_hint_and_final_user_answer(self) -> None:
+        manager = SessionManager()
+        manager.start()
+        manager.record_external_question("question_link", "Как вы обеспечивали надежность?")
+        manager.record_answer_delta("question_link", "Упомяните резервирование и наблюдаемость.")
+        manager.ingest_transcript("mic", "Я обеспечивал", is_final=False, detect_question=False)
+        manager.ingest_transcript(
+            "mic",
+            "Я обеспечивал резервирование и добавил метрики",
+            detect_question=False,
+        )
+
+        exchange = manager.snapshot()["memory"]["exchanges"][-1]
+
+        self.assertEqual(exchange["questionId"], "question_link")
+        self.assertEqual(exchange["hint"], "Упомяните резервирование и наблюдаемость.")
+        self.assertEqual(exchange["userAnswer"], "Я обеспечивал резервирование и добавил метрики")
+
     def test_late_answer_delta_does_not_change_current_question(self) -> None:
         manager = SessionManager()
         manager.start()

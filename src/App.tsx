@@ -129,7 +129,7 @@ export function App() {
 
     events.addEventListener("transcript", (event) => {
       const payload = parseEvent<TranscriptTurn>(event);
-      setTurns((current) => [...current.slice(-39), payload]);
+      setTurns((current) => mergeTranscriptTurn(current, payload));
     });
 
     events.addEventListener("question", (event) => {
@@ -604,8 +604,8 @@ export function App() {
             {turns.length === 0 ? (
               <p className="dialogue-empty">После включения здесь появятся реплики встречи.</p>
             ) : (
-              turns.map((turn, index) => (
-                <div className={`message-bubble ${turn.source}`} key={`${turn.timestampMs}-${index}`}>
+              turns.map((turn) => (
+                <div className={`message-bubble ${turn.source}`} key={turn.turnId}>
                   <strong>{turn.source === "remote" ? "Meet" : "Мы"}</strong>
                   <span>{turn.text}</span>
                 </div>
@@ -624,6 +624,18 @@ export function App() {
 
 function parseEvent<T>(event: Event): T {
   return JSON.parse((event as MessageEvent<string>).data) as T;
+}
+
+function mergeTranscriptTurn(current: TranscriptTurn[], update: TranscriptTurn): TranscriptTurn[] {
+  const next = [...current];
+  const index = next.findIndex((turn) => turn.turnId === update.turnId);
+  if (index >= 0) {
+    next[index] = update;
+  } else {
+    next.push(update);
+  }
+  const cutoff = update.timestampMs - (update.memoryWindowMs ?? 5 * 60 * 1000);
+  return next.filter((turn) => turn.timestampMs >= cutoff);
 }
 
 function StatusItem({ active, label, value }: { active: boolean; label: string; value: string }) {

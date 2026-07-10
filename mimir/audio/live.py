@@ -18,7 +18,14 @@ class SessionSink(Protocol):
     def start(self) -> dict[str, object]:
         ...
 
-    def ingest_transcript(self, source: str, text: str, is_final: bool = True) -> dict[str, object]:
+    def ingest_transcript(
+        self,
+        source: str,
+        text: str,
+        is_final: bool = True,
+        detect_question: bool = True,
+        is_refinement: bool = False,
+    ) -> dict[str, object]:
         ...
 
     def publish_status(self, event: str, payload: dict[str, object]) -> None:
@@ -211,7 +218,12 @@ class LiveAudioController:
                     isFinal=event.is_final,
                     endOfUtterance=event.end_of_utterance,
                 )
-                self.session.ingest_transcript(event.source, event.text, is_final=event.is_final)
+                self.session.ingest_transcript(
+                    event.source,
+                    event.text,
+                    is_final=event.is_final,
+                    is_refinement=event.is_refinement,
+                )
             self.publish("audio_status", {"source": source, "mode": self.mode, "status": "done"})
         except Exception as error:
             self.publish(

@@ -27,8 +27,10 @@ export interface SessionSnapshot {
   eventSequence: number;
   memory: {
     activeTopic: string;
+    windowMs: number;
     turns: TranscriptTurn[];
     questions: string[];
+    exchanges: DialogueExchange[];
   };
   metrics: Record<string, unknown>;
   currentQuestion: QuestionEvent | null;
@@ -39,10 +41,22 @@ export interface SessionSnapshot {
 }
 
 export interface TranscriptTurn {
+  turnId: string;
   source: "remote" | "mic";
   text: string;
   isFinal: boolean;
   timestampMs: number;
+  operation?: "append" | "replace";
+  memoryWindowMs?: number;
+}
+
+export interface DialogueExchange {
+  questionId: string;
+  question: string;
+  hint: string;
+  userAnswer: string;
+  timestampMs: number;
+  updatedAtMs: number;
 }
 
 export interface QuestionEvent {

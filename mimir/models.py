@@ -23,3 +23,4 @@ class SpeechRecognitionResult:
     is_final: bool
     end_of_utterance: bool = False
     confidence: float | None = None
+    is_refinement: bool = False

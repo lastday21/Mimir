@@ -66,6 +66,7 @@ class RealtimeSessionSink(Protocol):
         text: str,
         is_final: bool = True,
         detect_question: bool = True,
+        is_refinement: bool = False,
     ) -> dict[str, object]:
         ...
 
@@ -407,7 +408,13 @@ class RealtimeAudioController:
                 if stop_event.is_set():
                     return
                 self.record_stt_result(MIC_SOURCE, event.is_final)
-                self.session.ingest_transcript(MIC_SOURCE, event.text, is_final=event.is_final, detect_question=False)
+                self.session.ingest_transcript(
+                    MIC_SOURCE,
+                    event.text,
+                    is_final=event.is_final,
+                    detect_question=False,
+                    is_refinement=event.is_refinement,
+                )
                 if event.is_final and event.text.strip():
                     self._enqueue_dialogue_context(loop, queue, MIC_SOURCE)
         except Exception as error:
