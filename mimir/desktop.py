@@ -5,13 +5,14 @@ import http.client
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from .audio import LiveAudioConfig
-from .config import app_data_dir
+from .config import app_data_dir, load_config
 from .credentials import read_secret
-from .hotkeys import WindowsHotkeyController, audio_hotkey, overlay_hotkey
+from .hotkeys import HotkeySpec, WindowsHotkeyController, audio_hotkey, overlay_hotkey
 from .server import HOST, LIVE_AUDIO, STATIC_ROOT, create_server
 
 
@@ -82,14 +83,15 @@ def smoke_server(url: str) -> None:
 
 
 class DesktopWindowController:
-    def __init__(self, overlay_window: object) -> None:
+    def __init__(self, overlay_window: object, overlay_visible: bool = False) -> None:
         self.overlay_window = overlay_window
-        self.overlay_visible = True
+        self.overlay_visible = overlay_visible
         self._lock = threading.Lock()
+        config = load_config()
         self.hotkeys = WindowsHotkeyController(
             [
-                overlay_hotkey(self.toggle_overlay),
-                audio_hotkey(self.toggle_audio),
+                self._hotkey_or_default(overlay_hotkey, self.toggle_overlay, config.overlay_hotkey),
+                self._hotkey_or_default(audio_hotkey, self.toggle_audio, config.audio_hotkey),
             ]
         )
 
@@ -98,6 +100,17 @@ class DesktopWindowController:
 
     def stop(self) -> None:
         self.hotkeys.stop()
+
+    def _hotkey_or_default(
+        self,
+        factory: Callable[[Callable[[], None], str], HotkeySpec],
+        callback: Callable[[], None],
+        text: str,
+    ) -> HotkeySpec:
+        try:
+            return factory(callback, text)
+        except ValueError:
+            return factory(callback)
 
     def toggle_overlay(self) -> None:
         with self._lock:
@@ -147,6 +160,7 @@ def open_window(url: str, debug: bool) -> None:
         width=460,
         height=360,
         min_size=(360, 240),
+        hidden=True,
         frameless=True,
         easy_drag=True,
         on_top=True,

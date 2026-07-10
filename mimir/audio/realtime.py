@@ -91,6 +91,9 @@ class RealtimeAudioConfig:
     device_ids: dict[str, str] = field(default_factory=dict)
 
 
+RealtimeFallbackStarter = Callable[[RealtimeAudioConfig, str], object]
+
+
 class RealtimeAudioController:
     def __init__(
         self,
@@ -98,11 +101,13 @@ class RealtimeAudioController:
         speechkit_factory: RecognizerFactory,
         realtime_factory: RealtimeClientFactory | None = None,
         source_factory: PcmSourceFactory | None = None,
+        fallback_starter: RealtimeFallbackStarter | None = None,
     ) -> None:
         self.session = session
         self.speechkit_factory = speechkit_factory
         self.realtime_factory = realtime_factory or YandexRealtimeClient
         self.source_factory = source_factory or default_source_factory
+        self.fallback_starter = fallback_starter
         self._lock = threading.Lock()
         self._stop_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
@@ -111,6 +116,7 @@ class RealtimeAudioController:
         self._config: RealtimeAudioConfig | None = None
         self._last_error = ""
         self._last_dialogue_context = ""
+        self._fallback_started = False
 
     def start(self, config: RealtimeAudioConfig, api_key: str, folder_id: str) -> dict[str, object]:
         key = api_key.strip()
@@ -146,6 +152,7 @@ class RealtimeAudioController:
             self._running = True
             self._last_error = ""
             self._last_dialogue_context = ""
+            self._fallback_started = False
             stop_event = self._stop_event
 
         self.session.start()
@@ -231,13 +238,16 @@ class RealtimeAudioController:
             self._publish_error(REMOTE_SOURCE, str(error), running=False, phase="run")
         finally:
             with self._lock:
+                fallback_started = self._fallback_started
+            with self._lock:
                 self._running = False
                 self._active_sources = set()
                 if self._stop_event is stop_event:
                     self._stop_event = None
                 if self._thread is threading.current_thread():
                     self._thread = None
-            self.publish("audio_status", {"status": "idle", "mode": "yandex_realtime", "running": False})
+            if not fallback_started:
+                self.publish("audio_status", {"status": "idle", "mode": "yandex_realtime", "running": False})
 
     async def _run_async(self, api_key: str, folder_id: str, stop_event: threading.Event) -> None:
         config = self._config
@@ -648,6 +658,41 @@ class RealtimeAudioController:
                 "running": running,
             },
         )
+        if phase == "server_event":
+            with self._lock:
+                stop_event = self._stop_event
+            if stop_event is not None:
+                stop_event.set()
+            self._start_fallback(error)
+        elif not running and phase == "run":
+            self._start_fallback(error)
+
+    def _start_fallback(self, reason: str) -> None:
+        if self.fallback_starter is None:
+            return
+        with self._lock:
+            if self._fallback_started or self._config is None:
+                return
+            self._fallback_started = True
+            config = self._config
+
+        def run_fallback() -> None:
+            try:
+                self.fallback_starter(config, reason)
+            except Exception as error:
+                trace_live_event("audio.fallback_error", mode="local_vosk", error=str(error))
+                self.publish(
+                    "audio_error",
+                    {
+                        "source": REMOTE_SOURCE,
+                        "mode": "local_vosk",
+                        "phase": "fallback",
+                        "error": str(error),
+                        "running": False,
+                    },
+                )
+
+        threading.Thread(target=run_fallback, name="mimir-local-audio-fallback", daemon=True).start()
 
     def _stale_thread(self) -> threading.Thread | None:
         with self._lock:

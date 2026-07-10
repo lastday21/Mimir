@@ -13,6 +13,7 @@ from .credentials import read_secret
 from .dialogue import MIC_SOURCE, REMOTE_SOURCE, DialogueMemory, DialogueTurn
 from .live_trace import trace_live_event
 from .models import ChatMessage
+from .ollama_fallback import select_preferred_model
 from .prompts import build_realtime_messages
 from .providers import OllamaClient, YandexAIStudioClient
 from .providers.base import ProviderError
@@ -24,6 +25,14 @@ class SessionEvent:
     sequence: int
     event: str
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AnswerStreamChunk:
+    text: str
+    provider: str
+    fallback_used: bool = False
+    fallback_reason: str = ""
 
 
 class SessionManager:
@@ -46,6 +55,7 @@ class SessionManager:
         self._active_question_id = ""
         self._cancelled_streams = 0
         self._generation = 0
+        self._answer_provider_override: str | None = None
 
     def start(self) -> dict[str, Any]:
         with self._condition:
@@ -137,6 +147,18 @@ class SessionManager:
 
     def publish_status(self, event: str, payload: dict[str, Any]) -> None:
         self._publish(event, payload)
+
+    def set_answer_provider_override(self, provider: str | None) -> None:
+        clean = provider.strip().lower() if provider else ""
+        with self._condition:
+            self._answer_provider_override = clean or None
+            self._metrics["answerProviderOverride"] = self._answer_provider_override
+            self._metrics["updatedAt"] = int(time.time() * 1000)
+            trace_live_event(
+                "session.answer_provider_override",
+                sessionId=self._session_id,
+                provider=self._answer_provider_override or "",
+            )
 
     def record_audio_speech_started(self, source: str) -> None:
         source = normalize_source(source)
@@ -403,11 +425,12 @@ class SessionManager:
                     return
                 context = self._memory.build_context(self._session_id, question_id, question, confidence)
             messages = build_realtime_messages(question, context.to_prompt_text())
-            for chunk in self._stream_answer(messages):
+            for item in self._stream_answer(messages):
+                chunk = answer_chunk(item, self.provider_name())
                 if cancel.is_set() or not self._generation_matches(generation):
                     self._publish_if_current(generation, "answer_cancelled", {"questionId": question_id})
                     return
-                if not chunk:
+                if not chunk.text:
                     continue
                 if first_delta_at is None:
                     first_delta_at = time.monotonic()
@@ -418,16 +441,27 @@ class SessionManager:
                         "tLlmTtfbMs",
                         elapsed_ms(started, first_delta_at),
                     )
-                    self._record_question_field_if_current(generation, question_id, "provider", self.provider_name())
+                    self._record_question_field_if_current(generation, question_id, "provider", chunk.provider)
+                    if chunk.fallback_used:
+                        self._record_question_field_if_current(generation, question_id, "fallbackUsed", True)
+                        if chunk.fallback_reason:
+                            self._record_question_field_if_current(
+                                generation,
+                                question_id,
+                                "fallbackReason",
+                                chunk.fallback_reason,
+                            )
                     self.record_answer_first_hint(question_id)
                 self._publish_if_current(
                     generation,
                     "answer_delta",
                     {
                         "questionId": question_id,
-                        "deltaText": chunk,
+                        "deltaText": chunk.text,
                         "stage": "full_hint",
                         "latencyMs": elapsed_ms(started, time.monotonic()),
+                        "provider": chunk.provider,
+                        "fallbackUsed": chunk.fallback_used,
                     },
                 )
             self._publish_if_current(
@@ -450,13 +484,53 @@ class SessionManager:
                         self._state = "listening"
                         self.publish_locked("session_state", self.snapshot_locked())
 
-    def _stream_answer(self, messages: list[ChatMessage]) -> Iterator[str]:
+    def _stream_answer(self, messages: list[ChatMessage]) -> Iterator[AnswerStreamChunk | str]:
         config = load_config()
-        if config.llm_provider == "ollama":
-            yield from OllamaClient(config.ollama_base_url).stream_chat(config.llm_model, messages)
+        provider = self.provider_name(config)
+        if provider == "ollama":
+            client = OllamaClient(config.ollama_base_url)
+            model = self.ollama_model(config, client)
+            for chunk in client.stream_chat(model, messages):
+                yield AnswerStreamChunk(chunk, provider="ollama")
             return
         key = read_secret("yandex_ai_studio") or ""
-        yield from YandexAIStudioClient(key, config.yandex_folder_id).stream_chat(config.llm_model, messages)
+        primary_started = False
+        try:
+            for chunk in YandexAIStudioClient(key, config.yandex_folder_id).stream_chat(config.llm_model, messages):
+                if chunk:
+                    primary_started = True
+                yield AnswerStreamChunk(chunk, provider="yandex_ai_studio")
+        except ProviderError as error:
+            if primary_started:
+                raise
+            yield from self._stream_ollama_fallback(messages, error)
+
+    def _stream_ollama_fallback(
+        self,
+        messages: list[ChatMessage],
+        primary_error: ProviderError,
+    ) -> Iterator[AnswerStreamChunk]:
+        config = load_config()
+        client = OllamaClient(config.ollama_base_url)
+        try:
+            preferred = select_preferred_model(client.list_models())
+        except ProviderError as error:
+            raise ProviderError(f"Yandex AI Studio failed: {primary_error}. Ollama fallback failed: {error}") from error
+        if preferred is None:
+            raise ProviderError(f"Yandex AI Studio failed: {primary_error}. Ollama fallback has no local models")
+        reason = str(primary_error)
+        trace_live_event(
+            "answer.fallback",
+            fromProvider="yandex_ai_studio",
+            toProvider="ollama",
+            model=preferred.id,
+            reason=reason,
+        )
+        try:
+            for chunk in client.stream_chat(preferred.id, messages):
+                yield AnswerStreamChunk(chunk, provider="ollama", fallback_used=True, fallback_reason=reason)
+        except ProviderError as error:
+            raise ProviderError(f"Yandex AI Studio failed: {primary_error}. Ollama fallback failed: {error}") from error
 
     def _publish(self, event: str, payload: dict[str, Any]) -> None:
         with self._condition:
@@ -510,6 +584,7 @@ class SessionManager:
         payload["questions"] = [public_metric(metric) for metric in self._question_metrics[-20:]]
         payload["currentQuestionId"] = self._active_question_id
         payload["cancelledStreams"] = self._cancelled_streams
+        payload["answerProviderOverride"] = self._answer_provider_override
         return payload
 
     def build_question_metric_locked(
@@ -583,11 +658,25 @@ class SessionManager:
     def trace_question_metric_locked(self, metric: dict[str, Any]) -> None:
         trace_live_event("metric.question", **public_metric(metric))
 
-    def provider_name(self) -> str:
+    def provider_name(self, config: Any | None = None) -> str:
+        with self._condition:
+            override = self._answer_provider_override
+        if override:
+            return override
         try:
-            return load_config().llm_provider
+            return (config or load_config()).llm_provider
         except Exception:
             return "unknown"
+
+    def ollama_model(self, config: Any, client: OllamaClient) -> str:
+        with self._condition:
+            forced_ollama = self._answer_provider_override == "ollama" and config.llm_provider != "ollama"
+        if not forced_ollama:
+            return str(config.llm_model)
+        preferred = select_preferred_model(client.list_models())
+        if preferred is None:
+            raise ProviderError("Ollama fallback has no local models")
+        return preferred.id
 
     def snapshot_locked(self) -> dict[str, Any]:
         return {
@@ -622,6 +711,12 @@ def normalize_source(source: str) -> str:
 
 def normalize_question_key(text: str) -> str:
     return " ".join(text.lower().strip().rstrip("?!.").split())
+
+
+def answer_chunk(item: AnswerStreamChunk | str, default_provider: str) -> AnswerStreamChunk:
+    if isinstance(item, AnswerStreamChunk):
+        return item
+    return AnswerStreamChunk(str(item), provider=default_provider)
 
 
 def new_id(prefix: str) -> str:

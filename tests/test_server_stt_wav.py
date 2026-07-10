@@ -213,6 +213,156 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             server.read_secret = original_read_secret
             server.load_config = original_load_config
 
+    def test_starts_local_vosk_audio_session(self) -> None:
+        original_live_audio = server.LIVE_AUDIO
+        original_realtime_audio = server.REALTIME_AUDIO
+        original_local_audio = server.LOCAL_AUDIO
+        calls: list[tuple[tuple[str, ...], str, bool]] = []
+
+        class FakeAudio:
+            def stop(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+            def snapshot(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+        class FakeLocalAudio:
+            def start(self, config, key: str) -> dict[str, object]:
+                calls.append((config.sources, key, config.vad_enabled))
+                return {
+                    "running": True,
+                    "mode": "local_vosk",
+                    "sources": list(config.sources),
+                    "language": config.language,
+                    "sampleRateHertz": config.sample_rate_hertz,
+                    "chunkDurationMs": config.chunk_duration_ms,
+                    "vadEnabled": config.vad_enabled,
+                }
+
+            def stop(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+            def snapshot(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+        server.LIVE_AUDIO = FakeAudio()
+        server.REALTIME_AUDIO = FakeAudio()
+        server.LOCAL_AUDIO = FakeLocalAudio()
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            body = json.dumps({"sources": ["remote", "mic"], "mode": "local_vosk", "vadEnabled": True}).encode("utf-8")
+            conn = HTTPConnection(host, port, timeout=5)
+            conn.request(
+                "POST",
+                "/api/session/audio/start",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            conn.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertTrue(payload["running"])
+            self.assertEqual(payload["mode"], "local_vosk")
+            self.assertEqual(calls, [(("remote", "mic"), "", True)])
+            self.assertEqual(server.SESSION_MANAGER.metrics()["answerProviderOverride"], "ollama")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.SESSION_MANAGER.set_answer_provider_override(None)
+            server.LIVE_AUDIO = original_live_audio
+            server.REALTIME_AUDIO = original_realtime_audio
+            server.LOCAL_AUDIO = original_local_audio
+
+    def test_realtime_start_falls_back_to_local_vosk_on_provider_error(self) -> None:
+        original_live_audio = server.LIVE_AUDIO
+        original_realtime_audio = server.REALTIME_AUDIO
+        original_local_audio = server.LOCAL_AUDIO
+        original_read_secret = server.read_secret
+        original_load_config = server.load_config
+        local_calls: list[tuple[tuple[str, ...], str]] = []
+
+        class FakeLiveAudio:
+            def stop(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+            def snapshot(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+        class FailingRealtimeAudio:
+            def start(self, _config, _key: str, _folder_id: str) -> dict[str, object]:
+                raise server.ProviderError("quota exceeded")
+
+            def stop(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+            def snapshot(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+        class FakeLocalAudio:
+            def start(self, config, key: str) -> dict[str, object]:
+                local_calls.append((config.sources, key))
+                return {"running": True, "mode": "local_vosk", "sources": list(config.sources)}
+
+            def stop(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+            def snapshot(self) -> dict[str, object]:
+                return {"running": False, "sources": []}
+
+        class FakeConfig:
+            yandex_folder_id = "folder-id"
+
+        server.LIVE_AUDIO = FakeLiveAudio()
+        server.REALTIME_AUDIO = FailingRealtimeAudio()
+        server.LOCAL_AUDIO = FakeLocalAudio()
+        server.read_secret = lambda name: "test-key" if name == "yandex_ai_studio" else ""
+        server.load_config = lambda: FakeConfig()
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            body = json.dumps({"sources": ["remote"], "mode": "yandex_realtime"}).encode("utf-8")
+            conn = HTTPConnection(host, port, timeout=5)
+            conn.request(
+                "POST",
+                "/api/session/audio/start",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            conn.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["mode"], "local_vosk")
+            self.assertEqual(local_calls, [(("remote",), "")])
+            self.assertEqual(server.SESSION_MANAGER.metrics()["answerProviderOverride"], "ollama")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.SESSION_MANAGER.set_answer_provider_override(None)
+            server.LIVE_AUDIO = original_live_audio
+            server.REALTIME_AUDIO = original_realtime_audio
+            server.LOCAL_AUDIO = original_local_audio
+            server.read_secret = original_read_secret
+            server.load_config = original_load_config
+
     def test_realtime_audio_preflight_rejects_missing_folder(self) -> None:
         original_live_audio = server.LIVE_AUDIO
         original_realtime_audio = server.REALTIME_AUDIO

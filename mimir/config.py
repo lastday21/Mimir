@@ -16,9 +16,13 @@ class AppConfig:
     llm_provider: str = "yandex_ai_studio"
     llm_model: str = "yandexgpt/latest"
     ollama_base_url: str = "http://localhost:11434"
+    overlay_hotkey: str = "Ctrl+M"
+    audio_hotkey: str = "Ctrl+Space"
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "AppConfig":
+        hotkeys = data.get("hotkeys")
+        hotkey_data = hotkeys if isinstance(hotkeys, dict) else {}
         return cls(
             yandex_folder_id=str(
                 data.get("yandexFolderId")
@@ -28,6 +32,18 @@ class AppConfig:
             llm_provider=str(data.get("llmProvider") or data.get("llm_provider") or "yandex_ai_studio"),
             llm_model=str(data.get("llmModel") or data.get("llm_model") or "yandexgpt/latest"),
             ollama_base_url=str(data.get("ollamaBaseUrl") or data.get("ollama_base_url") or "http://localhost:11434"),
+            overlay_hotkey=str(
+                hotkey_data.get("overlayToggle")
+                or data.get("overlayHotkey")
+                or data.get("overlay_hotkey")
+                or "Ctrl+M"
+            ),
+            audio_hotkey=str(
+                hotkey_data.get("audioToggle")
+                or data.get("audioHotkey")
+                or data.get("audio_hotkey")
+                or "Ctrl+Space"
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -37,6 +53,10 @@ class AppConfig:
             "llmProvider": data["llm_provider"],
             "llmModel": data["llm_model"],
             "ollamaBaseUrl": data["ollama_base_url"],
+            "hotkeys": {
+                "overlayToggle": data["overlay_hotkey"],
+                "audioToggle": data["audio_hotkey"],
+            },
         }
 
 

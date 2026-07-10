@@ -1,5 +1,5 @@
 export type Provider = "yandex_ai_studio" | "ollama";
-export type AudioMode = "yandex_realtime" | "speechkit";
+export type AudioMode = "yandex_realtime" | "speechkit" | "local_vosk";
 
 export interface AppConfig {
   yandexFolderId: string;
@@ -7,6 +7,10 @@ export interface AppConfig {
   llmModel: string;
   ollamaBaseUrl: string;
   hasYandexKey: boolean;
+  hotkeys: {
+    overlayToggle: string;
+    audioToggle: string;
+  };
 }
 
 export interface ModelInfo {

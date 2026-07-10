@@ -51,10 +51,15 @@ class LiveAudioController:
         session: SessionSink,
         recognizer_factory: RecognizerFactory,
         source_factory: PcmSourceFactory | None = None,
+        *,
+        mode: str = "speechkit",
+        requires_api_key: bool = True,
     ) -> None:
         self.session = session
         self.recognizer_factory = recognizer_factory
         self.source_factory = source_factory or default_source_factory
+        self.mode = mode
+        self.requires_api_key = requires_api_key
         self._lock = threading.Lock()
         self._stop_event: threading.Event | None = None
         self._threads: dict[str, threading.Thread] = {}
@@ -64,7 +69,7 @@ class LiveAudioController:
 
     def start(self, config: LiveAudioConfig, api_key: str) -> dict[str, object]:
         key = api_key.strip()
-        if not key:
+        if self.requires_api_key and not key:
             raise ProviderError("Yandex SpeechKit API key is not configured")
         sources = normalize_sources(config.sources)
         if not sources:
@@ -90,7 +95,7 @@ class LiveAudioController:
         self.session.start()
         trace_live_event(
             "audio.start",
-            mode="speechkit",
+            mode=self.mode,
             sources=list(sources),
             language=self._config.language,
             sampleRateHertz=self._config.sample_rate_hertz,
@@ -102,6 +107,7 @@ class LiveAudioController:
             "audio_status",
             {
                 "status": "starting",
+                "mode": self.mode,
                 "running": True,
                 "sources": list(sources),
             },
@@ -130,8 +136,8 @@ class LiveAudioController:
         if not was_running:
             return self.snapshot()
 
-        trace_live_event("audio.stop", mode="speechkit")
-        self.publish("audio_status", {"status": "stopping", "running": False})
+        trace_live_event("audio.stop", mode=self.mode)
+        self.publish("audio_status", {"status": "stopping", "mode": self.mode, "running": False})
         if stop_event is not None:
             stop_event.set()
         for thread in threads:
@@ -142,7 +148,7 @@ class LiveAudioController:
             }
             if not self._threads:
                 self._stop_event = None
-        self.publish("audio_status", {"status": "stopped", "running": False})
+        self.publish("audio_status", {"status": "stopped", "mode": self.mode, "running": False})
         return self.snapshot()
 
     def snapshot(self) -> dict[str, object]:
@@ -153,7 +159,7 @@ class LiveAudioController:
         config = self._config
         return {
             "running": self._running,
-            "mode": "speechkit",
+            "mode": self.mode,
             "sources": sorted(self._active_sources),
             "language": config.language if config else "ru-RU",
             "sampleRateHertz": config.sample_rate_hertz if config else 16_000,
@@ -190,7 +196,7 @@ class LiveAudioController:
             )
             self.publish(
                 "audio_status",
-                {"source": source, "status": "streaming", "running": True},
+                {"source": source, "mode": self.mode, "status": "streaming", "running": True},
             )
             runner = SpeechKitStreamRunner(recognizer, stream_config)
             for event in runner.run(source, chunks):
@@ -198,18 +204,19 @@ class LiveAudioController:
                     break
                 self.record_stt_result(event.source, event.is_final)
                 trace_live_event(
-                    "speechkit.transcript",
+                    "stt.transcript",
                     source=event.source,
+                    mode=self.mode,
                     text=event.text,
                     isFinal=event.is_final,
                     endOfUtterance=event.end_of_utterance,
                 )
                 self.session.ingest_transcript(event.source, event.text, is_final=event.is_final)
-            self.publish("audio_status", {"source": source, "status": "done"})
+            self.publish("audio_status", {"source": source, "mode": self.mode, "status": "done"})
         except Exception as error:
             self.publish(
                 "audio_error",
-                {"source": source, "error": str(error), "running": self.snapshot()["running"]},
+                {"source": source, "mode": self.mode, "error": str(error), "running": self.snapshot()["running"]},
             )
         finally:
             self._finish_source(source)
@@ -245,10 +252,10 @@ class LiveAudioController:
                 )
                 last_level_at = now
             if decision.speech_started:
-                self.publish("audio_status", {"source": source, "status": "speech"})
+                self.publish("audio_status", {"source": source, "mode": self.mode, "status": "speech"})
                 self.record_audio_speech_started(source)
             if decision.speech_ended:
-                self.publish("audio_status", {"source": source, "status": "silence"})
+                self.publish("audio_status", {"source": source, "mode": self.mode, "status": "silence"})
             if decision.send_to_stt:
                 self.record_audio_chunk(source, len(chunk))
                 yield chunk
@@ -263,7 +270,7 @@ class LiveAudioController:
                 self._stop_event = None
                 should_publish_idle = True
         if should_publish_idle:
-            self.publish("audio_status", {"status": "idle", "running": False})
+            self.publish("audio_status", {"status": "idle", "mode": self.mode, "running": False})
 
     def publish(self, event: str, payload: dict[str, object]) -> None:
         self.session.publish_status(event, payload)

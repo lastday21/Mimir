@@ -1,4 +1,5 @@
 import time
+import threading
 import unittest
 from collections.abc import AsyncIterator
 from collections.abc import Iterable, Iterator
@@ -353,6 +354,75 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertTrue(
             any(
                 event == "audio_error" and payload.get("phase") == "reconnect"
+                for event, payload in session.events
+            )
+        )
+
+    def test_realtime_controller_falls_back_after_server_error_event(self) -> None:
+        session = FakeSession()
+        fallback_called = threading.Event()
+        fallback_calls: list[tuple[tuple[str, ...], str, bool]] = []
+
+        class ErrorRealtimeClient:
+            def __init__(self, _config) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback) -> None:
+                pass
+
+            async def setup_session(self, instructions: str, sample_rate_hertz: int) -> None:
+                pass
+
+            async def append_audio(self, pcm: bytes) -> None:
+                pass
+
+            async def add_dialogue_context(self, text: str) -> None:
+                pass
+
+            async def events(self) -> AsyncIterator[dict[str, object]]:
+                yield {"type": "error", "error": {"message": "quota exhausted"}}
+
+        def fallback_starter(config: RealtimeAudioConfig, reason: str) -> None:
+            fallback_calls.append((config.sources, reason, config.vad_enabled))
+            fallback_called.set()
+
+        controller = RealtimeAudioController(
+            session,
+            lambda _key: FakeRecognizer(),
+            ErrorRealtimeClient,
+            lambda _source, _config: FakePcmSource([pcm_constant(1000, 3200), pcm_constant(0, 1600)]),
+            fallback_starter,
+        )
+
+        controller.start(
+            RealtimeAudioConfig(
+                sources=("remote",),
+                chunk_duration_ms=200,
+                vad_enabled=True,
+                vad=EnergyVadConfig(
+                    speech_rms_threshold=100,
+                    silence_rms_threshold=50,
+                    tail_silence_ms=500,
+                    min_speech_ms=1,
+                ),
+            ),
+            "test-key",
+            "folder-id",
+        )
+
+        self.assertTrue(fallback_called.wait(2))
+        deadline = time.monotonic() + 2
+        while controller.snapshot()["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertFalse(controller.snapshot()["running"])
+        self.assertEqual(fallback_calls, [(("remote",), "quota exhausted", True)])
+        self.assertTrue(
+            any(
+                event == "audio_error" and payload.get("phase") == "server_event"
                 for event, payload in session.events
             )
         )
