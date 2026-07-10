@@ -17,6 +17,31 @@ from .audio import (
     RealtimeAudioController,
     list_audio_devices,
 )
+from .audio.preflight import (
+    PreflightDependencies,
+    add_device_checks as add_audio_device_checks,
+    add_import_check as add_audio_import_check,
+    add_ollama_checks as add_audio_ollama_checks,
+    add_preflight_check as append_preflight_check,
+    add_speechkit_checks as add_audio_speechkit_checks,
+    build_live_audio_preflight as prepare_live_audio_preflight,
+    normalize_live_audio_source as normalize_audio_source,
+    parse_live_audio_request as parse_audio_request,
+)
+from .audio.runtime import (
+    AudioRuntimeDependencies,
+    active_audio_snapshot as current_audio_snapshot,
+    audio_is_running as runtime_audio_is_running,
+    copy_live_audio_config as clone_live_audio_config,
+    idle_audio_snapshot as empty_audio_snapshot,
+    pause_live_session as pause_audio_session,
+    start_cloud_audio_fallback_locked as start_cloud_fallback,
+    start_live_audio_locked as start_audio,
+    start_local_audio_fallback_locked as start_local_fallback,
+    stop_all_audio_locked as stop_audio_controllers,
+    stop_live_audio as stop_audio,
+    stop_live_session as stop_audio_session,
+)
 from .config import AppConfig, load_config, save_config
 from .credentials import read_secret, write_secret
 from .hotkeys import normalize_hotkey_text
@@ -317,25 +342,18 @@ def start_live_audio(payload: dict[str, Any]) -> dict[str, object]:
 
 
 def start_live_audio_locked(payload: dict[str, Any]) -> dict[str, object]:
-    mode, common_config = parse_live_audio_request(payload)
-    stop_all_audio_locked()
-    if mode == "speechkit":
-        SESSION_MANAGER.set_answer_provider_override(None)
-        key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
-        return LIVE_AUDIO.start(LiveAudioConfig(**common_config), key)
-    if mode == "local_vosk":
-        SESSION_MANAGER.set_answer_provider_override("ollama")
-        return LOCAL_AUDIO.start(LiveAudioConfig(**common_config), "")
-    if mode != "yandex_realtime":
-        raise ValueError("audio mode must be yandex_realtime, speechkit, or local_vosk")
+    return start_audio(payload, audio_runtime_dependencies(), parse_live_audio_request)
 
-    SESSION_MANAGER.set_answer_provider_override(None)
-    config = load_config()
-    key = read_secret("yandex_ai_studio") or read_secret("yandex_speechkit") or ""
-    try:
-        return REALTIME_AUDIO.start(RealtimeAudioConfig(**common_config), key, config.yandex_folder_id)
-    except ProviderError as error:
-        return start_cloud_audio_fallback_locked(RealtimeAudioConfig(**common_config), str(error))
+
+def audio_runtime_dependencies() -> AudioRuntimeDependencies:
+    return AudioRuntimeDependencies(
+        session_manager=SESSION_MANAGER,
+        live_audio=LIVE_AUDIO,
+        local_audio=LOCAL_AUDIO,
+        realtime_audio=REALTIME_AUDIO,
+        load_config=load_config,
+        read_secret=read_secret,
+    )
 
 
 def config_payload(config: AppConfig) -> dict[str, Any]:
@@ -363,82 +381,28 @@ def model_payload(model: ModelInfo) -> dict[str, Any]:
 
 
 def parse_live_audio_request(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    sources = payload.get("sources") or ["remote", "mic"]
-    if isinstance(sources, str):
-        sources = [sources]
-    if not isinstance(sources, list):
-        raise ValueError("sources must be a list")
-    device_ids = payload.get("deviceIds") or {}
-    if not isinstance(device_ids, dict):
-        raise ValueError("deviceIds must be an object")
-    mode = str(payload.get("mode") or load_config().audio_mode).strip().lower()
-    if mode not in {"yandex_realtime", "speechkit", "local_vosk"}:
-        raise ValueError("audio mode must be yandex_realtime, speechkit, or local_vosk")
-    return (
-        mode,
-        {
-            "sources": tuple(normalize_live_audio_source(str(source)) for source in sources),
-            "language": str(payload.get("language") or "ru-RU"),
-            "sample_rate_hertz": int(payload.get("sampleRateHertz") or 16_000),
-            "chunk_duration_ms": int(payload.get("chunkDurationMs") or 200),
-            "vad_enabled": bool(payload.get("vadEnabled", True)),
-            "device_ids": {str(key): str(value) for key, value in device_ids.items()},
-        },
-    )
+    return parse_audio_request(payload, load_config)
 
 
 def build_live_audio_preflight(payload: dict[str, Any]) -> dict[str, Any]:
-    mode, common_config = parse_live_audio_request(payload)
-    sources = list(common_config["sources"])
-    device_ids = dict(common_config["device_ids"])
-    checks: list[dict[str, Any]] = []
+    return prepare_live_audio_preflight(payload, preflight_dependencies())
 
-    audio_running = audio_is_running()
-    add_preflight_check(
-        checks,
-        "audio_idle",
-        not audio_running,
-        "Live audio is already running" if audio_running else "Live audio is idle",
+
+def preflight_dependencies() -> PreflightDependencies:
+    return PreflightDependencies(
+        load_config=load_config,
+        read_secret=read_secret,
+        list_audio_devices=list_audio_devices,
+        local_vosk_status=local_vosk_status,
+        ollama_client=OllamaClient,
+        select_preferred_model=select_preferred_model,
+        import_module=import_module,
+        audio_is_running=audio_is_running,
     )
-    if mode == "yandex_realtime":
-        config = load_config()
-        add_preflight_check(checks, "yandex_folder_id", bool(config.yandex_folder_id.strip()), "Yandex folder ID is missing")
-        add_preflight_check(
-            checks,
-            "yandex_ai_studio_key",
-            bool(read_secret("yandex_ai_studio") or read_secret("yandex_speechkit")),
-            "Yandex AI Studio API key is missing",
-        )
-        add_import_check(checks, "aiohttp", "aiohttp", "Realtime websocket dependency is missing")
-        if "mic" in sources:
-            add_speechkit_checks(checks)
-    elif mode == "speechkit":
-        add_speechkit_checks(checks)
-    elif mode == "local_vosk":
-        add_local_stt_checks(checks)
-        add_ollama_checks(checks)
-
-    add_device_checks(checks, sources, device_ids)
-    errors = [str(check["detail"]) for check in checks if not check["ok"]]
-    return {
-        "ok": not errors,
-        "mode": mode,
-        "sources": sources,
-        "deviceIds": device_ids,
-        "checks": checks,
-        "errors": errors,
-    }
 
 
 def add_speechkit_checks(checks: list[dict[str, Any]]) -> None:
-    add_preflight_check(
-        checks,
-        "yandex_speechkit_key",
-        bool(read_secret("yandex_speechkit") or read_secret("yandex_ai_studio")),
-        "Yandex SpeechKit API key is missing",
-    )
-    add_import_check(checks, "grpc", "grpc", "SpeechKit gRPC dependency is missing")
-    add_import_check(checks, "yandexcloud_stt", "yandex.cloud.ai.stt.v3.stt_service_pb2_grpc", "SpeechKit stubs are missing")
+    add_audio_speechkit_checks(checks, preflight_dependencies())
 
 
 def add_local_stt_checks(checks: list[dict[str, Any]]) -> None:
@@ -451,73 +415,27 @@ def add_local_stt_checks(checks: list[dict[str, Any]]) -> None:
 
 
 def add_ollama_checks(checks: list[dict[str, Any]]) -> None:
-    config = load_config()
-    try:
-        models = OllamaClient(config.ollama_base_url).list_models()
-    except ProviderError as error:
-        add_preflight_check(checks, "ollama", False, str(error))
-        return
-    preferred = select_preferred_model(models)
-    add_preflight_check(
-        checks,
-        "ollama_model",
-        preferred is not None,
-        f"preferred local model: {preferred.id}" if preferred else "No local Ollama models are installed",
-    )
+    add_audio_ollama_checks(checks, preflight_dependencies())
 
 
 def normalize_live_audio_source(source: str) -> str:
-    value = source.strip().lower()
-    if value in {"remote", "them", "system", "loopback"}:
-        return "remote"
-    if value in {"mic", "me", "user"}:
-        return "mic"
-    raise ValueError("audio source must be remote or mic")
+    return normalize_audio_source(source)
 
 
 def add_device_checks(checks: list[dict[str, Any]], sources: list[str], device_ids: dict[str, str]) -> None:
-    try:
-        devices = list_audio_devices()
-    except AudioCaptureError as error:
-        add_preflight_check(checks, "audio_devices", False, str(error))
-        return
-
-    add_preflight_check(checks, "audio_devices", True, f"{len(devices)} capture devices available")
-    for source in sources:
-        source_devices = [device for device in devices if device.get("source") == source]
-        device_id = device_ids.get(source)
-        if device_id:
-            ok = any(str(device.get("id")) == device_id for device in source_devices)
-            detail = f"{source} device selected: {device_id}" if ok else f"{source} device is not available: {device_id}"
-            add_preflight_check(checks, f"{source}_device", ok, detail)
-        else:
-            detail = (
-                f"{len(source_devices)} {source} capture devices available"
-                if source_devices
-                else f"No {source} capture device is available"
-            )
-            add_preflight_check(checks, f"{source}_device", bool(source_devices), detail)
+    add_audio_device_checks(checks, sources, device_ids, list_audio_devices)
 
 
 def add_import_check(checks: list[dict[str, Any]], name: str, module: str, error: str) -> None:
-    try:
-        import_module(module)
-    except ImportError:
-        add_preflight_check(checks, name, False, error)
-        return
-    add_preflight_check(checks, name, True, "available")
+    add_audio_import_check(checks, name, module, error, import_module)
 
 
 def add_preflight_check(checks: list[dict[str, Any]], name: str, ok: bool, detail: str) -> None:
-    checks.append({"name": name, "ok": ok, "detail": detail})
+    append_preflight_check(checks, name, ok, detail)
 
 
 def audio_is_running() -> bool:
-    return bool(
-        REALTIME_AUDIO.snapshot().get("running")
-        or LIVE_AUDIO.snapshot().get("running")
-        or LOCAL_AUDIO.snapshot().get("running")
-    )
+    return runtime_audio_is_running(audio_runtime_dependencies())
 
 
 def stop_all_audio() -> None:
@@ -526,34 +444,22 @@ def stop_all_audio() -> None:
 
 
 def stop_all_audio_locked() -> None:
-    REALTIME_AUDIO.stop()
-    LIVE_AUDIO.stop()
-    LOCAL_AUDIO.stop()
+    stop_audio_controllers(audio_runtime_dependencies())
 
 
 def stop_live_audio() -> dict[str, object]:
     with AUDIO_CONTROL_LOCK:
-        active = active_audio_snapshot()
-        stop_all_audio_locked()
-        SESSION_MANAGER.set_answer_provider_override(None)
-        return {
-            **idle_audio_snapshot(),
-            "mode": str(active.get("mode") or "idle"),
-        }
+        return stop_audio(audio_runtime_dependencies())
 
 
 def pause_live_session() -> dict[str, Any]:
     with AUDIO_CONTROL_LOCK:
-        stop_all_audio_locked()
-        SESSION_MANAGER.set_answer_provider_override(None)
-        return SESSION_MANAGER.pause()
+        return pause_audio_session(audio_runtime_dependencies())
 
 
 def stop_live_session() -> dict[str, Any]:
     with AUDIO_CONTROL_LOCK:
-        stop_all_audio_locked()
-        SESSION_MANAGER.set_answer_provider_override(None)
-        return SESSION_MANAGER.stop()
+        return stop_audio_session(audio_runtime_dependencies())
 
 
 def toggle_live_audio() -> dict[str, object]:
@@ -592,24 +498,11 @@ def toggle_live_audio() -> dict[str, object]:
 
 
 def active_audio_snapshot() -> dict[str, object]:
-    for controller in (REALTIME_AUDIO, LIVE_AUDIO, LOCAL_AUDIO):
-        snapshot = controller.snapshot()
-        if snapshot.get("running"):
-            return snapshot
-    return idle_audio_snapshot()
+    return current_audio_snapshot(audio_runtime_dependencies())
 
 
 def idle_audio_snapshot() -> dict[str, object]:
-    return {
-        "running": False,
-        "mode": "idle",
-        "sources": [],
-        "language": "ru-RU",
-        "sampleRateHertz": 16_000,
-        "chunkDurationMs": 200,
-        "vadEnabled": True,
-        "deviceIds": {},
-    }
+    return empty_audio_snapshot()
 
 
 def start_cloud_audio_fallback(config: RealtimeAudioConfig, reason: str) -> dict[str, object]:
@@ -618,24 +511,7 @@ def start_cloud_audio_fallback(config: RealtimeAudioConfig, reason: str) -> dict
 
 
 def start_cloud_audio_fallback_locked(config: RealtimeAudioConfig, reason: str) -> dict[str, object]:
-    stop_all_audio_locked()
-    SESSION_MANAGER.set_answer_provider_override(None)
-    SESSION_MANAGER.publish_status(
-        "audio_status",
-        {
-            "status": "fallback",
-            "mode": "speechkit",
-            "source": "remote",
-            "reason": reason,
-            "running": True,
-        },
-    )
-    key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
-    try:
-        return LIVE_AUDIO.start(copy_live_audio_config(config), key)
-    except Exception as error:
-        combined_reason = f"Realtime: {reason}. SpeechKit: {error}"
-        return start_local_audio_fallback_locked(config, combined_reason)
+    return start_cloud_fallback(config, reason, audio_runtime_dependencies())
 
 
 def start_local_audio_fallback(config: RealtimeAudioConfig | LiveAudioConfig, reason: str) -> dict[str, object]:
@@ -647,31 +523,11 @@ def start_local_audio_fallback_locked(
     config: RealtimeAudioConfig | LiveAudioConfig,
     reason: str,
 ) -> dict[str, object]:
-    stop_all_audio_locked()
-    SESSION_MANAGER.set_answer_provider_override("ollama")
-    SESSION_MANAGER.publish_status(
-        "audio_status",
-        {
-            "status": "fallback",
-            "mode": "local_vosk",
-            "source": "remote",
-            "reason": reason,
-            "running": True,
-        },
-    )
-    return LOCAL_AUDIO.start(copy_live_audio_config(config), "")
+    return start_local_fallback(config, reason, audio_runtime_dependencies())
 
 
 def copy_live_audio_config(config: RealtimeAudioConfig | LiveAudioConfig) -> LiveAudioConfig:
-    return LiveAudioConfig(
-        sources=config.sources,
-        language=config.language,
-        sample_rate_hertz=config.sample_rate_hertz,
-        chunk_duration_ms=config.chunk_duration_ms,
-        vad_enabled=config.vad_enabled,
-        vad=config.vad,
-        device_ids=dict(config.device_ids),
-    )
+    return clone_live_audio_config(config)
 
 
 def run_wav_stt_job(job_id: str, source: str, language: str, chunk_duration_ms: int, data: bytes, key: str) -> None:

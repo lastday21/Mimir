@@ -1,14 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Bot, Check, Cloud, Loader2, MessageSquare, Pause, Play, Server, Settings } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Bot, Check, Loader2, MessageSquare, Pause, Play, Settings } from "lucide-react";
 import {
   AppConfig,
   AudioMode,
   AudioDevice,
   ModelInfo,
   Provider,
-  QuestionEvent,
-  SessionSnapshot,
-  TranscriptTurn,
   getConfig,
   listAudioDevices,
   listModels,
@@ -18,6 +15,14 @@ import {
   startLiveAudio,
   storeYandexKey
 } from "./api";
+import { SettingsPanel } from "./components/SettingsPanel";
+import {
+  AudioLevel,
+  AudioSource,
+  emptyAudioLevels,
+  isAudioMode,
+  useSessionEvents
+} from "./useSessionEvents";
 
 const DEFAULT_CONFIG: AppConfig = {
   yandexFolderId: "",
@@ -33,7 +38,6 @@ const DEFAULT_CONFIG: AppConfig = {
 };
 
 const IS_OVERLAY = window.location.hash === "#overlay";
-type AudioSource = "remote" | "mic";
 
 const DEFAULT_MODELS: Record<Provider, ModelInfo[]> = {
   yandex_ai_studio: [
@@ -47,42 +51,30 @@ const DEFAULT_MODELS: Record<Provider, ModelInfo[]> = {
   ]
 };
 
-const PROVIDER_NAMES: Record<Provider, string> = {
-  yandex_ai_studio: "Yandex AI Studio",
-  ollama: "Ollama"
-};
-
-const AUDIO_MODE_NAMES: Record<AudioMode, string> = {
-  yandex_realtime: "Яндекс Realtime — минимальная задержка",
-  speechkit: "SpeechKit — запасной облачный путь",
-  local_vosk: "Локально — Vosk и Ollama"
-};
-const SELECTABLE_AUDIO_MODES: AudioMode[] = ["yandex_realtime", "local_vosk"];
-
-interface AudioLevel {
-  rms: number;
-  level: number;
-  speech: boolean;
-}
-
 export function App() {
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
   const [apiKey, setApiKey] = useState("");
   const [modelsByProvider, setModelsByProvider] = useState<Record<Provider, ModelInfo[]>>(DEFAULT_MODELS);
   const [setupOpen, setSetupOpen] = useState(!IS_OVERLAY);
-  const [session, setSession] = useState<SessionSnapshot | null>(null);
-  const [turns, setTurns] = useState<TranscriptTurn[]>([]);
-  const [currentQuestion, setCurrentQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
-  const activeQuestionId = useRef("");
   const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
-  const [audioLevels, setAudioLevels] = useState<Record<AudioSource, AudioLevel>>(emptyAudioLevels());
   const [liveRemote, setLiveRemote] = useState(true);
   const [liveMic, setLiveMic] = useState(true);
-  const [audioMode, setAudioMode] = useState<AudioMode>("yandex_realtime");
-  const [audioRunning, setAudioRunning] = useState(false);
-  const [status, setStatus] = useState("Запустите сервер Mimir");
   const [busy, setBusy] = useState(false);
+  const {
+    answer,
+    applySessionSnapshot,
+    audioLevels,
+    audioMode,
+    audioRunning,
+    currentQuestion,
+    session,
+    setAudioLevels,
+    setAudioMode,
+    setAudioRunning,
+    setStatus,
+    status,
+    turns
+  } = useSessionEvents();
 
   useEffect(() => {
     document.body.classList.toggle("overlay-body", IS_OVERLAY);
@@ -114,132 +106,6 @@ export function App() {
       .catch((error) => setStatus(error.message));
   }, []);
 
-  useEffect(() => {
-    const events = new EventSource("/api/session/events");
-
-    events.addEventListener("session_snapshot", (event) => {
-      applySessionSnapshot(parseEvent<SessionSnapshot>(event));
-    });
-
-    events.addEventListener("session_state", (event) => {
-      const payload = parseEvent<SessionSnapshot>(event);
-      applySessionSnapshot(payload);
-      const lastError = typeof payload.metrics.lastError === "string" ? payload.metrics.lastError : "";
-      setStatus(payload.state === "degraded" ? lastError || "Сессия работает с ограничениями" : `Сессия: ${payload.state}`);
-    });
-
-    events.addEventListener("transcript", (event) => {
-      const payload = parseEvent<TranscriptTurn>(event);
-      setTurns((current) => mergeTranscriptTurn(current, payload));
-    });
-
-    events.addEventListener("question", (event) => {
-      const payload = parseEvent<QuestionEvent>(event);
-      activeQuestionId.current = payload.questionId;
-      setCurrentQuestion(payload.question);
-      setAnswer("");
-      setStatus("Вопрос найден");
-    });
-
-    events.addEventListener("answer_delta", (event) => {
-      const payload = parseEvent<{ questionId: string; deltaText: string }>(event);
-      if (payload.questionId !== activeQuestionId.current) return;
-      setAnswer((current) => current + payload.deltaText);
-    });
-
-    events.addEventListener("answer_done", (event) => {
-      const payload = parseEvent<{ questionId: string }>(event);
-      if (payload.questionId !== activeQuestionId.current) return;
-      setStatus("Ответ готов");
-    });
-
-    events.addEventListener("answer_cancelled", (event) => {
-      const payload = parseEvent<{ questionId: string }>(event);
-      if (payload.questionId !== activeQuestionId.current) return;
-      setStatus("Предыдущий ответ отменен");
-    });
-
-    events.addEventListener("answer_error", (event) => {
-      const payload = parseEvent<{ questionId: string; error: string }>(event);
-      if (payload.questionId !== activeQuestionId.current) return;
-      setStatus(payload.error);
-    });
-
-    events.addEventListener("stt_status", (event) => {
-      const payload = parseEvent<{ status: string; source: string }>(event);
-      setStatus(`Распознавание ${payload.source}: ${payload.status}`);
-    });
-
-    events.addEventListener("stt_error", (event) => {
-      const payload = parseEvent<{ error: string }>(event);
-      setStatus(payload.error);
-    });
-
-    events.addEventListener("audio_status", (event) => {
-      const payload = parseEvent<{ status: string; source?: string; running?: boolean; mode?: string }>(event);
-      if (payload.mode && isAudioMode(payload.mode)) {
-        setAudioMode(payload.mode);
-      }
-      if (typeof payload.running === "boolean") {
-        setAudioRunning(payload.running);
-        if (!payload.running) {
-          setAudioLevels(emptyAudioLevels());
-        }
-      }
-      setStatus(payload.source ? `Звук ${payload.source}: ${payload.status}` : `Звук: ${payload.status}`);
-    });
-
-    events.addEventListener("audio_level", (event) => {
-      const payload = parseEvent<{ source: AudioSource; rms: number; speech: boolean }>(event);
-      if (!isAudioSource(payload.source)) return;
-      setAudioLevels((current) => ({
-        ...current,
-        [payload.source]: {
-          rms: payload.rms,
-          level: rmsToLevel(payload.rms),
-          speech: payload.speech
-        }
-      }));
-    });
-
-    events.addEventListener("audio_error", (event) => {
-      const payload = parseEvent<{ error: string; running?: boolean }>(event);
-      if (typeof payload.running === "boolean") {
-        setAudioRunning(payload.running);
-        if (!payload.running) {
-          setAudioLevels(emptyAudioLevels());
-        }
-      }
-      setStatus(payload.error);
-    });
-
-    events.onerror = () => {
-      setStatus("Нет связи с сервером событий");
-    };
-
-    events.onopen = () => {
-      setStatus((current) => current === "Нет связи с сервером событий" ? "Сервер событий подключен" : current);
-    };
-
-    return () => events.close();
-  }, []);
-
-  function applySessionSnapshot(snapshot: SessionSnapshot) {
-    setSession(snapshot);
-    setTurns(snapshot.memory.turns);
-    const question = snapshot.currentQuestion;
-    activeQuestionId.current = question?.questionId ?? "";
-    setCurrentQuestion(question?.question ?? "");
-    setAnswer(
-      question && snapshot.currentAnswer.questionId === question.questionId
-        ? snapshot.currentAnswer.text
-        : ""
-    );
-  }
-
-  const providerIcon = useMemo(() => {
-    return config.llmProvider === "ollama" ? <Server size={18} /> : <Cloud size={18} />;
-  }, [config.llmProvider]);
   const providerModels = useMemo(() => {
     return modelOptionsForProvider(config, modelsByProvider);
   }, [config, modelsByProvider]);
@@ -284,16 +150,6 @@ export function App() {
         : defaultModelForProvider(provider, modelsByProvider)
     });
     setAudioMode(mode);
-  }
-
-  function updateHotkey(name: keyof AppConfig["hotkeys"], value: string) {
-    setConfig({
-      ...config,
-      hotkeys: {
-        ...config.hotkeys,
-        [name]: value
-      }
-    });
   }
 
   async function handleSaveSetup(closeAfterSave: boolean) {
@@ -345,13 +201,9 @@ export function App() {
     setBusy(true);
     try {
       const snapshot = await pauseSession();
-      setSession(snapshot);
+      applySessionSnapshot(snapshot);
       setAudioRunning(false);
       setAudioLevels(emptyAudioLevels());
-      setTurns([]);
-      activeQuestionId.current = "";
-      setCurrentQuestion("");
-      setAnswer("");
       setStatus("Сессия на паузе");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Не удалось поставить на паузу");
@@ -396,117 +248,20 @@ export function App() {
   }
 
   const settingsPanel = (
-    <section className="panel settings-panel">
-      <div className="section-title">
-        {providerIcon}
-        <h2>Настройка</h2>
-      </div>
-
-      <div className="settings-grid">
-        <label>
-          Провайдер
-          <select value={config.llmProvider} onChange={(event) => handleProviderChange(event.target.value as Provider)}>
-            <option value="yandex_ai_studio">{PROVIDER_NAMES.yandex_ai_studio}</option>
-            <option value="ollama">{PROVIDER_NAMES.ollama}</option>
-          </select>
-        </label>
-
-        <label>
-          Модель ответа
-          <select
-            value={config.llmModel}
-            onChange={(event) => setConfig({ ...config, llmModel: event.target.value })}
-          >
-            {providerModels.map((model) => (
-              <option key={model.id} value={model.id}>
-                {modelLabel(model)}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label>
-          Обработка звука
-          <select
-            value={config.audioMode}
-            onChange={(event) => handleAudioModeChange(event.target.value as AudioMode)}
-          >
-            {SELECTABLE_AUDIO_MODES.map((mode) => (
-              <option key={mode} value={mode}>{AUDIO_MODE_NAMES[mode]}</option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      {config.llmProvider === "yandex_ai_studio" ? (
-        <div className="provider-fields">
-          <label>
-            Папка Yandex Cloud
-            <input
-              value={config.yandexFolderId}
-              onChange={(event) => setConfig({ ...config, yandexFolderId: event.target.value })}
-              placeholder="folder id"
-            />
-          </label>
-
-          <label>
-            API-ключ Яндекса
-            <input
-              type="password"
-              placeholder={config.hasYandexKey ? "Ключ сохранен" : "Вставьте API-ключ"}
-              value={apiKey}
-              onChange={(event) => setApiKey(event.target.value)}
-            />
-          </label>
-        </div>
-      ) : (
-        <div className="provider-fields single">
-          <label>
-            Адрес Ollama
-            <input
-              value={config.ollamaBaseUrl}
-              onChange={(event) => setConfig({ ...config, ollamaBaseUrl: event.target.value })}
-            />
-          </label>
-        </div>
-      )}
-
-      <div className="hotkey-fields">
-        <label>
-          Показать или скрыть окно подсказки
-          <input
-            value={config.hotkeys.overlayToggle}
-            onChange={(event) => updateHotkey("overlayToggle", event.target.value)}
-            placeholder="Ctrl+M"
-          />
-        </label>
-        <label>
-          Включить или поставить прослушивание на паузу
-          <input
-            value={config.hotkeys.audioToggle}
-            onChange={(event) => updateHotkey("audioToggle", event.target.value)}
-            placeholder="Ctrl+Space"
-          />
-        </label>
-      </div>
-      <p className="setup-note">Горячие клавиши применятся после перезапуска окна Mimir.</p>
-
-      <div className="setup-actions">
-        <button onClick={handleLoadModels} disabled={busy}>
-          <Loader2 className={busy ? "spin" : ""} size={16} />
-          Обновить модели
-        </button>
-        <button onClick={() => handleSaveSetup(false)} disabled={busy}>
-          Сохранить
-        </button>
-        <button className="primary" onClick={() => handleSaveSetup(true)} disabled={busy || !setupReady}>
-          <Check size={16} />
-          Открыть приложение
-        </button>
-      </div>
-
-      {setupProblem && <p className="setup-hint">{setupProblem}</p>}
-    </section>
+    <SettingsPanel
+      apiKey={apiKey}
+      busy={busy}
+      config={config}
+      models={providerModels}
+      setupProblem={setupProblem}
+      setupReady={setupReady}
+      onApiKeyChange={setApiKey}
+      onAudioModeChange={handleAudioModeChange}
+      onConfigChange={setConfig}
+      onLoadModels={handleLoadModels}
+      onProviderChange={handleProviderChange}
+      onSave={handleSaveSetup}
+    />
   );
 
   if (!IS_OVERLAY && setupOpen) {
@@ -621,22 +376,6 @@ export function App() {
       </section>
     </main>
   );
-}
-
-function parseEvent<T>(event: Event): T {
-  return JSON.parse((event as MessageEvent<string>).data) as T;
-}
-
-function mergeTranscriptTurn(current: TranscriptTurn[], update: TranscriptTurn): TranscriptTurn[] {
-  const next = [...current];
-  const index = next.findIndex((turn) => turn.turnId === update.turnId);
-  if (index >= 0) {
-    next[index] = update;
-  } else {
-    next.push(update);
-  }
-  const cutoff = update.timestampMs - (update.memoryWindowMs ?? 5 * 60 * 1000);
-  return next.filter((turn) => turn.timestampMs >= cutoff);
 }
 
 function StatusItem({ active, label, value }: { active: boolean; label: string; value: string }) {
@@ -756,11 +495,6 @@ function selectedOrFirstModel(currentModel: string, models: ModelInfo[]): string
   return models[0]?.id ?? currentModel;
 }
 
-function modelLabel(model: ModelInfo): string {
-  const context = model.contextWindow ? `, ${Math.round(model.contextWindow / 1000)}K` : "";
-  return `${model.name || model.id}${context}`;
-}
-
 function setupValidationMessage(config: AppConfig, apiKey: string): string | null {
   if (!config.llmModel.trim()) {
     return "Выберите модель.";
@@ -786,25 +520,6 @@ function setupValidationMessage(config: AppConfig, apiKey: string): string | nul
     return "Укажите адрес Ollama.";
   }
   return null;
-}
-
-function emptyAudioLevels(): Record<AudioSource, AudioLevel> {
-  return {
-    remote: { rms: 0, level: 0, speech: false },
-    mic: { rms: 0, level: 0, speech: false }
-  };
-}
-
-function rmsToLevel(rms: number): number {
-  return Math.max(0, Math.min(1, rms / 5000));
-}
-
-function isAudioSource(source: string): source is AudioSource {
-  return source === "remote" || source === "mic";
-}
-
-function isAudioMode(mode: string): mode is AudioMode {
-  return mode === "yandex_realtime" || mode === "speechkit" || mode === "local_vosk";
 }
 
 function statusIsHealthy(status: string): boolean {
