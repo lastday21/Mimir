@@ -19,6 +19,129 @@ def sample_wav() -> bytes:
 
 
 class ServerSpeechKitWavTests(unittest.TestCase):
+    def test_local_preflight_rejects_missing_model(self) -> None:
+        original_import_check = server.add_import_check
+        original_local_vosk_status = server.local_vosk_status
+        server.add_import_check = lambda checks, name, _module, _error: server.add_preflight_check(
+            checks, name, True, "available"
+        )
+        server.local_vosk_status = lambda: {
+            "model": "vosk-model-small-ru-0.22",
+            "path": "F:\\missing-model",
+            "installed": False,
+        }
+        checks: list[dict[str, object]] = []
+        try:
+            server.add_local_stt_checks(checks)
+        finally:
+            server.add_import_check = original_import_check
+            server.local_vosk_status = original_local_vosk_status
+
+        model_check = next(check for check in checks if check["name"] == "local_stt_model")
+        self.assertFalse(model_check["ok"])
+
+    def test_hotkey_toggle_uses_configured_audio_mode(self) -> None:
+        original_audio_is_running = server.audio_is_running
+        original_build_preflight = server.build_live_audio_preflight
+        original_load_config = server.load_config
+        original_start_locked = server.start_live_audio_locked
+        requests: list[dict[str, object]] = []
+
+        class FakeConfig:
+            audio_mode = "speechkit"
+
+        server.audio_is_running = lambda: False
+        server.build_live_audio_preflight = lambda payload: {
+            "ok": True,
+            "errors": [],
+            "mode": payload["mode"],
+        }
+        server.load_config = lambda: FakeConfig()
+        server.start_live_audio_locked = lambda payload: requests.append(payload) or {
+            "running": True,
+            "mode": payload["mode"],
+            "sources": payload["sources"],
+        }
+        try:
+            payload = server.toggle_live_audio()
+        finally:
+            server.audio_is_running = original_audio_is_running
+            server.build_live_audio_preflight = original_build_preflight
+            server.load_config = original_load_config
+            server.start_live_audio_locked = original_start_locked
+
+        self.assertEqual(payload["mode"], "speechkit")
+        self.assertEqual(requests[0]["mode"], "speechkit")
+
+    def test_starting_audio_mode_stops_every_other_controller(self) -> None:
+        original_live_audio = server.LIVE_AUDIO
+        original_realtime_audio = server.REALTIME_AUDIO
+        original_local_audio = server.LOCAL_AUDIO
+        original_read_secret = server.read_secret
+        events: list[str] = []
+
+        class FakeAudio:
+            def __init__(self, name: str, running: bool = False) -> None:
+                self.name = name
+                self.running = running
+
+            def start(self, *_args) -> dict[str, object]:
+                events.append(f"start:{self.name}")
+                self.running = True
+                return {"running": True, "mode": self.name, "sources": ["remote"]}
+
+            def stop(self) -> dict[str, object]:
+                events.append(f"stop:{self.name}")
+                self.running = False
+                return {"running": False, "mode": self.name, "sources": []}
+
+            def snapshot(self) -> dict[str, object]:
+                return {"running": self.running, "mode": self.name, "sources": ["remote"] if self.running else []}
+
+        server.REALTIME_AUDIO = FakeAudio("yandex_realtime", running=True)
+        server.LIVE_AUDIO = FakeAudio("speechkit")
+        server.LOCAL_AUDIO = FakeAudio("local_vosk")
+        server.read_secret = lambda _name: "test-key"
+        try:
+            payload = server.start_live_audio({"mode": "speechkit", "sources": ["remote"]})
+
+            self.assertTrue(payload["running"])
+            self.assertEqual(
+                events,
+                ["stop:yandex_realtime", "stop:speechkit", "stop:local_vosk", "start:speechkit"],
+            )
+            self.assertFalse(server.REALTIME_AUDIO.snapshot()["running"])
+            self.assertTrue(server.LIVE_AUDIO.snapshot()["running"])
+            self.assertFalse(server.LOCAL_AUDIO.snapshot()["running"])
+        finally:
+            server.LIVE_AUDIO = original_live_audio
+            server.REALTIME_AUDIO = original_realtime_audio
+            server.LOCAL_AUDIO = original_local_audio
+            server.read_secret = original_read_secret
+
+    def test_audio_device_error_returns_json_response(self) -> None:
+        original_list_audio_devices = server.list_audio_devices
+        server.list_audio_devices = lambda: (_ for _ in ()).throw(RuntimeError("device failure"))
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            conn = HTTPConnection(host, port, timeout=5)
+            conn.request("GET", "/api/audio/devices")
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            conn.close()
+
+            self.assertEqual(response.status, 500)
+            self.assertEqual(payload["error"], "device failure")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.list_audio_devices = original_list_audio_devices
+
     def test_starts_wav_stt_job(self) -> None:
         original_job = server.run_wav_stt_job
         original_read_secret = server.read_secret

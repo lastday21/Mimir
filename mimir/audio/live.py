@@ -218,6 +218,8 @@ class LiveAudioController:
                 "audio_error",
                 {"source": source, "mode": self.mode, "error": str(error), "running": self.snapshot()["running"]},
             )
+            if source == REMOTE_SOURCE:
+                self.mark_degraded("remote_producer", str(error))
         finally:
             self._finish_source(source)
 
@@ -289,6 +291,11 @@ class LiveAudioController:
         recorder = getattr(self.session, "record_stt_result", None)
         if callable(recorder):
             recorder(source, is_final)
+
+    def mark_degraded(self, phase: str, error: str) -> None:
+        marker = getattr(self.session, "mark_degraded", None)
+        if callable(marker):
+            marker(phase, error)
 
 
 def default_source_factory(source: str, config: AudioCaptureConfig) -> SoundcardPcmSource:

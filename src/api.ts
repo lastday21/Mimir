@@ -5,6 +5,7 @@ export interface AppConfig {
   yandexFolderId: string;
   llmProvider: Provider;
   llmModel: string;
+  audioMode: AudioMode;
   ollamaBaseUrl: string;
   hasYandexKey: boolean;
   hotkeys: {
@@ -23,12 +24,18 @@ export interface ModelInfo {
 export interface SessionSnapshot {
   sessionId: string;
   state: string;
+  eventSequence: number;
   memory: {
     activeTopic: string;
     turns: TranscriptTurn[];
     questions: string[];
   };
   metrics: Record<string, unknown>;
+  currentQuestion: QuestionEvent | null;
+  currentAnswer: {
+    questionId: string;
+    text: string;
+  };
 }
 
 export interface TranscriptTurn {

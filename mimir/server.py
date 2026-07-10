@@ -24,7 +24,7 @@ from .models import ModelInfo
 from .ollama_fallback import select_preferred_model, sort_models
 from .providers import OllamaClient, YandexAIStudioClient, YandexSpeechKitClient
 from .providers.base import ProviderError
-from .session import SessionManager, sse_payload
+from .session import SessionEvent, SessionManager, sse_payload
 from .stt import AudioStreamConfig, SpeechKitStreamRunner, pcm_chunks_from_wav
 from .stt.local_vosk import LocalVoskRecognizer, local_vosk_status
 
@@ -46,6 +46,7 @@ REALTIME_AUDIO = RealtimeAudioController(
     YandexSpeechKitClient,
     fallback_starter=lambda config, reason: start_local_audio_fallback(config, reason),
 )
+AUDIO_CONTROL_LOCK = threading.RLock()
 MAX_DEV_WAV_BYTES = 25_000_000
 
 
@@ -54,25 +55,34 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/health":
-            self.send_json({"ok": True})
-            return
-        if parsed.path == "/api/config":
-            self.send_json(config_payload(load_config()))
-            return
-        if parsed.path == "/api/models":
-            self.handle_models()
-            return
-        if parsed.path == "/api/audio/devices":
-            self.handle_audio_devices()
-            return
-        if parsed.path == "/api/metrics/current":
-            self.send_json(SESSION_MANAGER.metrics())
-            return
-        if parsed.path == "/api/session/events":
-            self.handle_session_events(parsed.query)
-            return
-        self.handle_static(parsed.path)
+        try:
+            if parsed.path == "/api/health":
+                self.send_json({"ok": True})
+                return
+            if parsed.path == "/api/config":
+                self.send_json(config_payload(load_config()))
+                return
+            if parsed.path == "/api/models":
+                self.handle_models()
+                return
+            if parsed.path == "/api/audio/devices":
+                self.handle_audio_devices()
+                return
+            if parsed.path == "/api/metrics/current":
+                self.send_json(SESSION_MANAGER.metrics())
+                return
+            if parsed.path == "/api/session/events":
+                self.handle_session_events(parsed.query)
+                return
+            self.handle_static(parsed.path)
+        except ProviderError as error:
+            self.send_json({"error": str(error)}, status=502)
+        except AudioCaptureError as error:
+            self.send_json({"error": str(error)}, status=502)
+        except ValueError as error:
+            self.send_json({"error": str(error)}, status=400)
+        except Exception as error:
+            self.send_json({"error": str(error)}, status=500)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -150,76 +160,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json({"available": False, "devices": [], "error": str(error)})
 
     def handle_session_stop(self) -> None:
-        stop_all_audio()
-        SESSION_MANAGER.set_answer_provider_override(None)
-        self.send_json(SESSION_MANAGER.stop())
+        self.send_json(stop_live_session())
 
     def handle_session_pause(self) -> None:
-        stop_all_audio()
-        SESSION_MANAGER.set_answer_provider_override(None)
-        self.send_json(SESSION_MANAGER.pause())
+        self.send_json(pause_live_session())
 
     def handle_live_audio_preflight(self) -> None:
         self.send_json(build_live_audio_preflight(self.read_json()))
 
     def handle_live_audio_start(self) -> None:
-        payload = self.read_json()
-        mode, common_config = parse_live_audio_request(payload)
-        if mode == "speechkit":
-            REALTIME_AUDIO.stop()
-            LOCAL_AUDIO.stop()
-            SESSION_MANAGER.set_answer_provider_override(None)
-            key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
-            self.send_json(LIVE_AUDIO.start(LiveAudioConfig(**common_config), key))
-            return
-        if mode == "local_vosk":
-            LIVE_AUDIO.stop()
-            REALTIME_AUDIO.stop()
-            SESSION_MANAGER.set_answer_provider_override("ollama")
-            self.send_json(LOCAL_AUDIO.start(LiveAudioConfig(**common_config), ""))
-            return
-        if mode != "yandex_realtime":
-            raise ValueError("audio mode must be yandex_realtime, speechkit, or local_vosk")
-
-        LIVE_AUDIO.stop()
-        LOCAL_AUDIO.stop()
-        SESSION_MANAGER.set_answer_provider_override(None)
-        config = load_config()
-        key = read_secret("yandex_ai_studio") or read_secret("yandex_speechkit") or ""
-        try:
-            self.send_json(REALTIME_AUDIO.start(RealtimeAudioConfig(**common_config), key, config.yandex_folder_id))
-        except ProviderError as error:
-            self.send_json(start_local_audio_fallback(RealtimeAudioConfig(**common_config), str(error)))
+        self.send_json(start_live_audio(self.read_json()))
 
     def handle_live_audio_stop(self) -> None:
-        realtime_was_running = bool(REALTIME_AUDIO.snapshot().get("running"))
-        speechkit_was_running = bool(LIVE_AUDIO.snapshot().get("running"))
-        local_was_running = bool(LOCAL_AUDIO.snapshot().get("running"))
-        if realtime_was_running:
-            self.send_json(REALTIME_AUDIO.stop())
-            return
-        if speechkit_was_running:
-            self.send_json(LIVE_AUDIO.stop())
-            return
-        if local_was_running:
-            payload = LOCAL_AUDIO.stop()
-            SESSION_MANAGER.set_answer_provider_override(None)
-            self.send_json(payload)
-            return
-        stop_all_audio()
-        SESSION_MANAGER.set_answer_provider_override(None)
-        self.send_json(
-            {
-                "running": False,
-                "mode": "idle",
-                "sources": [],
-                "language": "ru-RU",
-                "sampleRateHertz": 16_000,
-                "chunkDurationMs": 200,
-                "vadEnabled": True,
-                "deviceIds": {},
-            }
-        )
+        self.send_json(stop_live_audio())
 
     def handle_session_transcript(self) -> None:
         payload = self.read_json()
@@ -249,11 +202,20 @@ class ApiHandler(BaseHTTPRequestHandler):
     def handle_session_events(self, query: str) -> None:
         params = parse_qs(query)
         after = 0
+        has_cursor = False
         if params.get("after"):
             try:
                 after = int(params["after"][0])
+                has_cursor = True
             except ValueError:
                 after = 0
+        last_event_id = self.headers.get("Last-Event-ID")
+        if last_event_id:
+            try:
+                after = max(after, int(last_event_id))
+                has_cursor = True
+            except ValueError:
+                pass
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -262,6 +224,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", ALLOWED_CORS_HEADERS)
         self.end_headers()
         try:
+            if not has_cursor:
+                snapshot = SESSION_MANAGER.snapshot()
+                after = int(snapshot["eventSequence"])
+                self.wfile.write(sse_payload(SessionEvent(after, "session_snapshot", snapshot)))
+                self.wfile.flush()
             for event in SESSION_MANAGER.listen(after=after):
                 self.wfile.write(sse_payload(event))
                 self.wfile.flush()
@@ -332,11 +299,39 @@ class ApiHandler(BaseHTTPRequestHandler):
         return
 
 
+def start_live_audio(payload: dict[str, Any]) -> dict[str, object]:
+    with AUDIO_CONTROL_LOCK:
+        return start_live_audio_locked(payload)
+
+
+def start_live_audio_locked(payload: dict[str, Any]) -> dict[str, object]:
+    mode, common_config = parse_live_audio_request(payload)
+    stop_all_audio_locked()
+    if mode == "speechkit":
+        SESSION_MANAGER.set_answer_provider_override(None)
+        key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
+        return LIVE_AUDIO.start(LiveAudioConfig(**common_config), key)
+    if mode == "local_vosk":
+        SESSION_MANAGER.set_answer_provider_override("ollama")
+        return LOCAL_AUDIO.start(LiveAudioConfig(**common_config), "")
+    if mode != "yandex_realtime":
+        raise ValueError("audio mode must be yandex_realtime, speechkit, or local_vosk")
+
+    SESSION_MANAGER.set_answer_provider_override(None)
+    config = load_config()
+    key = read_secret("yandex_ai_studio") or read_secret("yandex_speechkit") or ""
+    try:
+        return REALTIME_AUDIO.start(RealtimeAudioConfig(**common_config), key, config.yandex_folder_id)
+    except ProviderError as error:
+        return start_local_audio_fallback_locked(RealtimeAudioConfig(**common_config), str(error))
+
+
 def config_payload(config: AppConfig) -> dict[str, Any]:
     return {
         "yandexFolderId": config.yandex_folder_id,
         "llmProvider": config.llm_provider,
         "llmModel": config.llm_model,
+        "audioMode": config.audio_mode,
         "ollamaBaseUrl": config.ollama_base_url,
         "hasYandexKey": bool(read_secret("yandex_ai_studio")),
         "hotkeys": {
@@ -364,7 +359,7 @@ def parse_live_audio_request(payload: dict[str, Any]) -> tuple[str, dict[str, An
     device_ids = payload.get("deviceIds") or {}
     if not isinstance(device_ids, dict):
         raise ValueError("deviceIds must be an object")
-    mode = str(payload.get("mode") or "yandex_realtime").strip().lower()
+    mode = str(payload.get("mode") or load_config().audio_mode).strip().lower()
     if mode not in {"yandex_realtime", "speechkit", "local_vosk"}:
         raise ValueError("audio mode must be yandex_realtime, speechkit, or local_vosk")
     return (
@@ -439,8 +434,8 @@ def add_local_stt_checks(checks: list[dict[str, Any]]) -> None:
     status = local_vosk_status()
     detail = f"{status['model']} at {status['path']}"
     if not status["installed"]:
-        detail = f"{detail}; will download on first local start"
-    add_preflight_check(checks, "local_stt_model", True, detail)
+        detail = f"{detail}; install the model before starting local mode"
+    add_preflight_check(checks, "local_stt_model", bool(status["installed"]), detail)
 
 
 def add_ollama_checks(checks: list[dict[str, Any]]) -> None:
@@ -514,13 +509,104 @@ def audio_is_running() -> bool:
 
 
 def stop_all_audio() -> None:
+    with AUDIO_CONTROL_LOCK:
+        stop_all_audio_locked()
+
+
+def stop_all_audio_locked() -> None:
     REALTIME_AUDIO.stop()
     LIVE_AUDIO.stop()
     LOCAL_AUDIO.stop()
 
 
+def stop_live_audio() -> dict[str, object]:
+    with AUDIO_CONTROL_LOCK:
+        active = active_audio_snapshot()
+        stop_all_audio_locked()
+        SESSION_MANAGER.set_answer_provider_override(None)
+        return {
+            **idle_audio_snapshot(),
+            "mode": str(active.get("mode") or "idle"),
+        }
+
+
+def pause_live_session() -> dict[str, Any]:
+    with AUDIO_CONTROL_LOCK:
+        stop_all_audio_locked()
+        SESSION_MANAGER.set_answer_provider_override(None)
+        return SESSION_MANAGER.pause()
+
+
+def stop_live_session() -> dict[str, Any]:
+    with AUDIO_CONTROL_LOCK:
+        stop_all_audio_locked()
+        SESSION_MANAGER.set_answer_provider_override(None)
+        return SESSION_MANAGER.stop()
+
+
+def toggle_live_audio() -> dict[str, object]:
+    with AUDIO_CONTROL_LOCK:
+        mode = "idle"
+        try:
+            if audio_is_running():
+                pause_live_session()
+                return idle_audio_snapshot()
+
+            config = load_config()
+            mode = config.audio_mode
+            request = {
+                "mode": mode,
+                "sources": ["remote", "mic"],
+                "language": "ru-RU",
+                "vadEnabled": True,
+            }
+            preflight = build_live_audio_preflight(request)
+            if not preflight["ok"]:
+                errors = preflight.get("errors") or ["Live audio preflight failed"]
+                raise ProviderError(str(errors[0]))
+            return start_live_audio_locked(request)
+        except Exception as error:
+            SESSION_MANAGER.publish_status(
+                "audio_error",
+                {
+                    "source": "remote",
+                    "mode": mode,
+                    "phase": "control",
+                    "error": str(error),
+                    "running": False,
+                },
+            )
+            raise
+
+
+def active_audio_snapshot() -> dict[str, object]:
+    for controller in (REALTIME_AUDIO, LIVE_AUDIO, LOCAL_AUDIO):
+        snapshot = controller.snapshot()
+        if snapshot.get("running"):
+            return snapshot
+    return idle_audio_snapshot()
+
+
+def idle_audio_snapshot() -> dict[str, object]:
+    return {
+        "running": False,
+        "mode": "idle",
+        "sources": [],
+        "language": "ru-RU",
+        "sampleRateHertz": 16_000,
+        "chunkDurationMs": 200,
+        "vadEnabled": True,
+        "deviceIds": {},
+    }
+
+
 def start_local_audio_fallback(config: RealtimeAudioConfig, reason: str) -> dict[str, object]:
-    LIVE_AUDIO.stop()
+    with AUDIO_CONTROL_LOCK:
+        return start_local_audio_fallback_locked(config, reason)
+
+
+def start_local_audio_fallback_locked(config: RealtimeAudioConfig, reason: str) -> dict[str, object]:
+    stop_all_audio_locked()
     SESSION_MANAGER.set_answer_provider_override("ollama")
     SESSION_MANAGER.publish_status(
         "audio_status",

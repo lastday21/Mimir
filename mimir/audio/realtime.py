@@ -469,6 +469,7 @@ class RealtimeAudioController:
                 trace_live_event("realtime.answer.delta", delta=delta)
                 if not current_question_id:
                     current_question_id = self._publish_realtime_question(last_remote_text)
+                self.record_answer_delta(current_question_id, delta)
                 self.record_answer_first_hint(current_question_id, provider="yandex_realtime")
                 self.publish(
                     "answer_delta",
@@ -639,6 +640,11 @@ class RealtimeAudioController:
         if callable(recorder):
             recorder(question_id, provider=provider)
 
+    def record_answer_delta(self, question_id: str, text: str) -> None:
+        recorder = getattr(self.session, "record_answer_delta", None)
+        if callable(recorder):
+            recorder(question_id, text)
+
     def record_answer_done(self, question_id: str) -> None:
         recorder = getattr(self.session, "record_answer_done", None)
         if callable(recorder):
@@ -658,21 +664,23 @@ class RealtimeAudioController:
                 "running": running,
             },
         )
-        if phase == "server_event":
+        if phase in {"server_event", "remote_producer"}:
             with self._lock:
                 stop_event = self._stop_event
             if stop_event is not None:
                 stop_event.set()
-            self._start_fallback(error)
+            if not self._start_fallback(error):
+                self.mark_degraded(phase, error)
         elif not running and phase == "run":
-            self._start_fallback(error)
+            if not self._start_fallback(error):
+                self.mark_degraded(phase, error)
 
-    def _start_fallback(self, reason: str) -> None:
+    def _start_fallback(self, reason: str) -> bool:
         if self.fallback_starter is None:
-            return
+            return False
         with self._lock:
             if self._fallback_started or self._config is None:
-                return
+                return self._fallback_started
             self._fallback_started = True
             config = self._config
 
@@ -691,8 +699,15 @@ class RealtimeAudioController:
                         "running": False,
                     },
                 )
+                self.mark_degraded("fallback", str(error))
 
         threading.Thread(target=run_fallback, name="mimir-local-audio-fallback", daemon=True).start()
+        return True
+
+    def mark_degraded(self, phase: str, error: str) -> None:
+        marker = getattr(self.session, "mark_degraded", None)
+        if callable(marker):
+            marker(phase, error)
 
     def _stale_thread(self) -> threading.Thread | None:
         with self._lock:

@@ -79,6 +79,10 @@ class OllamaClient:
             raise ProviderError(f"Ollama returned HTTP {error.code}: {detail}") from error
         except urllib.error.URLError as error:
             raise ProviderError(f"Ollama is not reachable: {error.reason}") from error
+        except TimeoutError as error:
+            raise ProviderError("Ollama request timed out") from error
+        except OSError as error:
+            raise ProviderError(f"Ollama request failed: {error}") from error
 
 
 def parse_ollama_delta(payload: str) -> tuple[str, bool]:

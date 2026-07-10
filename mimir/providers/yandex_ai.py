@@ -115,6 +115,10 @@ class YandexAIStudioClient:
             raise ProviderError(f"Yandex AI Studio returned HTTP {error.code}: {detail}") from error
         except urllib.error.URLError as error:
             raise ProviderError(f"Yandex AI Studio is not reachable: {error.reason}") from error
+        except TimeoutError as error:
+            raise ProviderError("Yandex AI Studio request timed out") from error
+        except OSError as error:
+            raise ProviderError(f"Yandex AI Studio request failed: {error}") from error
 
     def normalize_model(self, model: str) -> str:
         model = model.strip()

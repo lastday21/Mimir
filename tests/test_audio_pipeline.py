@@ -1,10 +1,11 @@
+import os
 import time
 import threading
 import unittest
 from collections.abc import AsyncIterator
 from collections.abc import Iterable, Iterator
 
-from mimir.audio.capture import AudioCaptureConfig, float_frames_to_pcm16, select_loopback, select_microphone
+from mimir.audio.capture import AudioCaptureConfig, float_frames_to_pcm16, list_audio_devices, select_loopback, select_microphone
 from mimir.audio.live import LiveAudioConfig, LiveAudioController, normalize_sources
 from mimir.audio.realtime import REALTIME_INSTRUCTIONS, RealtimeAudioConfig, RealtimeAudioController
 from mimir.audio.vad import EnergyVadConfig, EnergyVadGate
@@ -114,6 +115,25 @@ class FakeSoundcard:
 
 
 class AudioPipelineTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows audio regression")
+    def test_lists_audio_devices_from_separate_windows_threads(self) -> None:
+        errors: list[Exception] = []
+
+        def read_devices() -> None:
+            try:
+                list_audio_devices()
+            except Exception as error:
+                errors.append(error)
+
+        for _ in range(3):
+            thread = threading.Thread(target=read_devices)
+            thread.start()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+
+        com_errors = [error for error in errors if "0x800401f0" in str(error).lower()]
+        self.assertEqual(com_errors, [])
+
     def test_normalizes_audio_sources(self) -> None:
         self.assertEqual(normalize_sources(["system", "me", "remote"]), ("remote", "mic"))
 
@@ -423,6 +443,42 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertTrue(
             any(
                 event == "audio_error" and payload.get("phase") == "server_event"
+                for event, payload in session.events
+            )
+        )
+
+    def test_realtime_controller_falls_back_when_remote_capture_fails(self) -> None:
+        session = FakeSession()
+        fallback_called = threading.Event()
+        fallback_reasons: list[str] = []
+
+        def missing_source(_source, _config):
+            raise RuntimeError("loopback lost")
+
+        def fallback_starter(_config: RealtimeAudioConfig, reason: str) -> None:
+            fallback_reasons.append(reason)
+            fallback_called.set()
+
+        controller = RealtimeAudioController(
+            session,
+            lambda _key: FakeRecognizer(),
+            source_factory=missing_source,
+            fallback_starter=fallback_starter,
+        )
+        config = RealtimeAudioConfig(sources=("remote",))
+        stop_event = threading.Event()
+        controller._config = config
+        controller._stop_event = stop_event
+        controller._running = True
+
+        controller._produce_remote_audio(config, stop_event, None, None)
+
+        self.assertTrue(fallback_called.wait(1))
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual(fallback_reasons, ["loopback lost"])
+        self.assertTrue(
+            any(
+                event == "audio_error" and payload.get("phase") == "remote_producer"
                 for event, payload in session.events
             )
         )

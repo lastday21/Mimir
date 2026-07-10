@@ -56,6 +56,8 @@ class SessionManager:
         self._cancelled_streams = 0
         self._generation = 0
         self._answer_provider_override: str | None = None
+        self._current_question: dict[str, Any] | None = None
+        self._current_answer_text = ""
 
     def start(self) -> dict[str, Any]:
         with self._condition:
@@ -67,6 +69,8 @@ class SessionManager:
             self._cancel_answer = threading.Event()
             self._last_question_key = ""
             self._last_question_at = 0.0
+            self._current_question = None
+            self._current_answer_text = ""
             self.reset_metrics_locked()
             self._state = "listening"
             payload = self.snapshot_locked()
@@ -93,6 +97,8 @@ class SessionManager:
             self._memory = DialogueMemory()
             self._last_question_key = ""
             self._last_question_at = 0.0
+            self._current_question = None
+            self._current_answer_text = ""
             self.reset_metrics_locked()
             self._state = "paused"
             payload = self.snapshot_locked()
@@ -147,6 +153,17 @@ class SessionManager:
 
     def publish_status(self, event: str, payload: dict[str, Any]) -> None:
         self._publish(event, payload)
+
+    def mark_degraded(self, phase: str, error: str) -> None:
+        with self._condition:
+            if self._state in {"paused", "stopped"}:
+                return
+            self._state = "degraded"
+            self._metrics["lastError"] = error
+            self._metrics["errorPhase"] = phase
+            self._metrics["updatedAt"] = int(time.time() * 1000)
+            self.publish_locked("session_state", self.snapshot_locked())
+            trace_live_event("session.degraded", sessionId=self._session_id, phase=phase, error=error)
 
     def set_answer_provider_override(self, provider: str | None) -> None:
         clean = provider.strip().lower() if provider else ""
@@ -259,6 +276,23 @@ class SessionManager:
                 provider=provider,
             )
             self.add_question_metric_locked(metric, question_ready_at=now)
+            self._current_question = {
+                "sessionId": self._session_id,
+                "questionId": question_id,
+                "question": question,
+                "confidence": confidence,
+                "reason": provider,
+                "context": {"activeTopic": self._memory.active_topic, "priorQuestions": self._memory.recent_questions()},
+            }
+            self._current_answer_text = ""
+
+    def record_answer_delta(self, question_id: str, text: str) -> None:
+        if not text:
+            return
+        with self._condition:
+            if question_id != self._active_question_id:
+                return
+            self._current_answer_text += text
 
     def record_answer_first_hint(self, question_id: str, *, provider: str | None = None) -> None:
         now = time.monotonic()
@@ -383,6 +417,8 @@ class SessionManager:
                     "priorQuestions": context.relevant_prior_questions,
                 },
             }
+            self._current_question = dict(payload)
+            self._current_answer_text = ""
             self.publish_locked("question", payload)
             trace_live_event(
                 "session.question",
@@ -432,6 +468,7 @@ class SessionManager:
                     return
                 if not chunk.text:
                     continue
+                self.record_answer_delta(question_id, chunk.text)
                 if first_delta_at is None:
                     first_delta_at = time.monotonic()
                     self._record_metric_if_current(generation, "llmTtfbMs", elapsed_ms(started, first_delta_at))
@@ -470,11 +507,15 @@ class SessionManager:
                 {"questionId": question_id, "latencyMs": elapsed_ms(started, time.monotonic())},
             )
             self.record_answer_done(question_id)
-        except ProviderError as error:
-            self._publish_if_current(generation, "answer_error", {"questionId": question_id, "error": str(error)})
+        except Exception as error:
+            message = str(error) or error.__class__.__name__
+            trace_live_event("answer.error", questionId=question_id, error=message)
+            self._publish_if_current(generation, "answer_error", {"questionId": question_id, "error": message})
             with self._condition:
                 if generation == self._generation:
                     self._state = "degraded"
+                    self._metrics["lastError"] = message
+                    self._metrics["errorPhase"] = "answer"
                     self.publish_locked("session_state", self.snapshot_locked())
             return
         finally:
@@ -684,6 +725,12 @@ class SessionManager:
             "state": self._state,
             "memory": self._memory.payload(),
             "metrics": self.metrics_locked(),
+            "eventSequence": self._sequence,
+            "currentQuestion": dict(self._current_question) if self._current_question else None,
+            "currentAnswer": {
+                "questionId": self._active_question_id,
+                "text": self._current_answer_text,
+            },
         }
 
     def publish_locked(self, event: str, payload: dict[str, Any]) -> None:

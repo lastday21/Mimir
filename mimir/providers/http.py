@@ -32,6 +32,10 @@ def request_json(
         raise ProviderError(f"{url} returned HTTP {error.code}: {detail}") from error
     except urllib.error.URLError as error:
         raise ProviderError(f"{url} is not reachable: {error.reason}") from error
+    except TimeoutError as error:
+        raise ProviderError(f"{url} timed out") from error
+    except OSError as error:
+        raise ProviderError(f"{url} failed: {error}") from error
 
     if not raw:
         return {}

@@ -8,6 +8,21 @@ from mimir.session import SessionManager
 
 
 class SessionControlTests(unittest.TestCase):
+    def test_late_answer_delta_does_not_change_current_question(self) -> None:
+        manager = SessionManager()
+        manager.start()
+        manager.record_external_question("question_old", "Старый вопрос")
+        manager.record_answer_delta("question_old", "Старый ответ")
+        manager.record_external_question("question_new", "Новый вопрос")
+
+        manager.record_answer_delta("question_old", " запоздал")
+        manager.record_answer_delta("question_new", "Новый ответ")
+        snapshot = manager.snapshot()
+
+        self.assertEqual(snapshot["currentQuestion"]["questionId"], "question_new")
+        self.assertEqual(snapshot["currentAnswer"]["questionId"], "question_new")
+        self.assertEqual(snapshot["currentAnswer"]["text"], "Новый ответ")
+
     def test_pause_closes_context_and_next_start_is_clean(self) -> None:
         manager = SessionManager()
         first = manager.start()
@@ -37,6 +52,34 @@ class SessionControlTests(unittest.TestCase):
 
 
 class ServerSessionControlTests(unittest.TestCase):
+    def test_new_event_stream_starts_with_current_snapshot(self) -> None:
+        original_session = server.SESSION_MANAGER
+        manager = SessionManager()
+        manager.start()
+        manager.ingest_transcript("remote", "Старое событие", detect_question=False)
+        server.SESSION_MANAGER = manager
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            connection = HTTPConnection(host, port, timeout=5)
+            connection.request("GET", "/api/session/events")
+            response = connection.getresponse()
+            lines = [response.fp.readline().decode("utf-8").strip() for _ in range(4)]
+            connection.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(lines[1], "event: session_snapshot")
+            snapshot = json.loads(lines[2].removeprefix("data: "))
+            self.assertEqual(snapshot["memory"]["turns"][-1]["text"], "Старое событие")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.SESSION_MANAGER = original_session
+
     def test_pause_route_stops_audio_and_closes_context(self) -> None:
         original_session = server.SESSION_MANAGER
         original_live_audio = server.LIVE_AUDIO

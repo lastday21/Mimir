@@ -9,6 +9,27 @@ from mimir.session import SessionManager
 
 
 class LlmFallbackTests(unittest.TestCase):
+    def test_unexpected_answer_error_marks_session_degraded(self) -> None:
+        class FailingSessionManager(SessionManager):
+            def _stream_answer(self, _messages: list[ChatMessage]):
+                raise TimeoutError("request timed out")
+
+        manager = FailingSessionManager()
+        manager.start()
+        manager.trigger_question("Как работает очередь?", confidence=0.9, reason="test")
+        self.wait_for_error(manager)
+        events = manager.listen(after=0)
+        answer_error = None
+        for _ in range(8):
+            event = next(events)
+            if event.event == "answer_error":
+                answer_error = event
+                break
+
+        self.assertIsNotNone(answer_error)
+        self.assertEqual(answer_error.payload["error"], "request timed out")
+        self.assertEqual(manager.snapshot()["metrics"]["errorPhase"], "answer")
+
     def test_yandex_failure_falls_back_to_preferred_ollama_model(self) -> None:
         original_load_config = session_module.load_config
         original_read_secret = session_module.read_secret

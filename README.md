@@ -25,7 +25,9 @@ pause or resume live audio capture.
 
 Default desktop hotkeys are `Ctrl+M` for showing or hiding the overlay and
 `Ctrl+Space` for pausing or resuming live audio capture. They can be changed in
-the settings screen and take effect after restarting the desktop window.
+the settings screen and take effect after restarting the desktop window. The
+audio hotkey uses the mode selected in settings and shares the same audio control
+path as the main window and overlay.
 
 ## Realtime Session Core
 
@@ -49,6 +51,8 @@ user's speech as dialogue history. `speechkit` mode remains available as a
 fallback that sends both sources through the local SpeechKit transcript bus.
 `local_vosk` mode is the offline path: local Vosk transcription feeds the same
 session memory/question detector, while answers are forced through Ollama.
+The settings screen exposes all three audio modes and keeps the local mode paired
+with Ollama so the displayed configuration matches the runtime path.
 
 If Yandex Realtime fails while starting or running, Mimir switches to
 `local_vosk` with the same audio sources. This fallback is intended for quota or

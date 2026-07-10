@@ -1,5 +1,6 @@
 import unittest
 
+import mimir.desktop as desktop
 from mimir.desktop import DesktopWindowController
 from mimir.hotkeys import (
     MOD_CONTROL,
@@ -58,6 +59,18 @@ class DesktopOverlayTests(unittest.TestCase):
         window.on_top = False
         controller.toggle_overlay()
         self.assertFalse(window.visible)
+
+    def test_audio_hotkey_uses_shared_audio_control(self) -> None:
+        original_toggle_live_audio = desktop.toggle_live_audio
+        calls: list[bool] = []
+        desktop.toggle_live_audio = lambda: calls.append(True) or {"running": True}
+        try:
+            controller = DesktopWindowController(FakeWindow())
+            controller.toggle_audio()
+        finally:
+            desktop.toggle_live_audio = original_toggle_live_audio
+
+        self.assertEqual(calls, [True])
 
 
 if __name__ == "__main__":

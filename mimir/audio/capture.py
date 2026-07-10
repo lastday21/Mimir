@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ctypes
+import os
 import threading
+from contextlib import contextmanager
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -74,47 +77,49 @@ class SoundcardPcmSource:
 
     def chunks(self, stop_event: threading.Event) -> Iterator[bytes]:
         sc = import_soundcard()
-        device = select_capture_device(sc, self.source, self.config.device_id)
-        frames_per_chunk = max(
-            1,
-            round(self.config.sample_rate_hertz * self.config.chunk_duration_ms / 1000),
-        )
+        with windows_com_apartment():
+            device = select_capture_device(sc, self.source, self.config.device_id)
+            frames_per_chunk = max(
+                1,
+                round(self.config.sample_rate_hertz * self.config.chunk_duration_ms / 1000),
+            )
 
-        with device.recorder(
-            samplerate=self.config.sample_rate_hertz,
-            channels=1,
-            blocksize=frames_per_chunk,
-        ) as recorder:
-            while not stop_event.is_set():
-                frames = recorder.record(numframes=frames_per_chunk)
-                pcm = float_frames_to_pcm16(frames)
-                if pcm:
-                    yield pcm
+            with device.recorder(
+                samplerate=self.config.sample_rate_hertz,
+                channels=1,
+                blocksize=frames_per_chunk,
+            ) as recorder:
+                while not stop_event.is_set():
+                    frames = recorder.record(numframes=frames_per_chunk)
+                    pcm = float_frames_to_pcm16(frames)
+                    if pcm:
+                        yield pcm
 
 
 def list_audio_devices() -> list[dict[str, Any]]:
     sc = import_soundcard()
-    devices: list[dict[str, Any]] = []
-    default_mic = safe_call(sc.default_microphone)
-    default_speaker = safe_call(sc.default_speaker)
-    recommended_mic = safe_select_capture_device(sc, MIC_SOURCE)
-    recommended_loopback = safe_select_capture_device(sc, REMOTE_SOURCE)
+    with windows_com_apartment():
+        devices: list[dict[str, Any]] = []
+        default_mic = safe_call(sc.default_microphone)
+        default_speaker = safe_call(sc.default_speaker)
+        recommended_mic = safe_select_capture_device(sc, MIC_SOURCE)
+        recommended_loopback = safe_select_capture_device(sc, REMOTE_SOURCE)
 
-    for device in sc.all_microphones(include_loopback=True):
-        loopback = is_loopback_device(device)
-        recommended = same_device(device, recommended_loopback) if loopback else same_device(device, recommended_mic)
-        devices.append(
-            {
-                "id": device_id(device),
-                "name": device_name(device),
-                "source": REMOTE_SOURCE if loopback else MIC_SOURCE,
-                "loopback": loopback,
-                "recommended": recommended,
-                "default": same_device(device, default_mic)
-                or (loopback and devices_look_related(device, default_speaker)),
-            }
-        )
-    return devices
+        for device in sc.all_microphones(include_loopback=True):
+            loopback = is_loopback_device(device)
+            recommended = same_device(device, recommended_loopback) if loopback else same_device(device, recommended_mic)
+            devices.append(
+                {
+                    "id": device_id(device),
+                    "name": device_name(device),
+                    "source": REMOTE_SOURCE if loopback else MIC_SOURCE,
+                    "loopback": loopback,
+                    "recommended": recommended,
+                    "default": same_device(device, default_mic)
+                    or (loopback and devices_look_related(device, default_speaker)),
+                }
+            )
+        return devices
 
 
 def select_capture_device(sc: Any, source: str, preferred_id: str | None = None) -> Any:
@@ -168,6 +173,28 @@ def import_soundcard() -> Any:
             "Live audio capture requires the `soundcard` package. Reinstall with `pip install -e .`."
         ) from error
     return sc
+
+
+@contextmanager
+def windows_com_apartment() -> Iterator[None]:
+    if os.name != "nt":
+        yield
+        return
+
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    result = int(ole32.CoInitializeEx(None, 0))
+    code = result & 0xFFFFFFFF
+    initialized = code in {0, 1}
+    if not initialized and code != 0x80010106:
+        raise AudioCaptureError(f"Windows audio initialization failed: {hex(code)}")
+
+    try:
+        yield
+    finally:
+        if initialized:
+            ole32.CoUninitialize()
 
 
 def safe_call(function: Any) -> Any | None:

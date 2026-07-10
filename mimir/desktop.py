@@ -9,11 +9,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .audio import LiveAudioConfig
 from .config import app_data_dir, load_config
-from .credentials import read_secret
 from .hotkeys import HotkeySpec, WindowsHotkeyController, audio_hotkey, overlay_hotkey
-from .server import HOST, LIVE_AUDIO, STATIC_ROOT, create_server
+from .server import HOST, STATIC_ROOT, create_server, toggle_live_audio
 
 
 APP_TITLE = "Mimir"
@@ -124,12 +122,7 @@ class DesktopWindowController:
 
     def toggle_audio(self) -> None:
         try:
-            snapshot = LIVE_AUDIO.snapshot()
-            if snapshot.get("running"):
-                LIVE_AUDIO.stop()
-                return
-            key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
-            LIVE_AUDIO.start(LiveAudioConfig(), key)
+            toggle_live_audio()
         except Exception as error:
             print(f"Audio hotkey failed: {error}", file=sys.stderr)
 

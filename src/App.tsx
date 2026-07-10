@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Bot, Check, Cloud, Loader2, MessageSquare, Pause, Play, Server, Settings } from "lucide-react";
 import {
   AppConfig,
@@ -23,6 +23,7 @@ const DEFAULT_CONFIG: AppConfig = {
   yandexFolderId: "",
   llmProvider: "yandex_ai_studio",
   llmModel: "yandexgpt/latest",
+  audioMode: "yandex_realtime",
   ollamaBaseUrl: "http://localhost:11434",
   hasYandexKey: false,
   hotkeys: {
@@ -51,6 +52,12 @@ const PROVIDER_NAMES: Record<Provider, string> = {
   ollama: "Ollama"
 };
 
+const AUDIO_MODE_NAMES: Record<AudioMode, string> = {
+  yandex_realtime: "Яндекс Realtime — минимальная задержка",
+  speechkit: "SpeechKit — через расшифровку",
+  local_vosk: "Локально — Vosk и Ollama"
+};
+
 interface AudioLevel {
   rms: number;
   level: number;
@@ -66,6 +73,7 @@ export function App() {
   const [turns, setTurns] = useState<TranscriptTurn[]>([]);
   const [currentQuestion, setCurrentQuestion] = useState("");
   const [answer, setAnswer] = useState("");
+  const activeQuestionId = useRef("");
   const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
   const [audioLevels, setAudioLevels] = useState<Record<AudioSource, AudioLevel>>(emptyAudioLevels());
   const [liveRemote, setLiveRemote] = useState(true);
@@ -84,6 +92,7 @@ export function App() {
     getConfig()
       .then((loaded) => {
         setConfig(loaded);
+        setAudioMode(loaded.audioMode);
         setStatus("Сервер подключен");
       })
       .catch((error) => setStatus(error.message));
@@ -107,10 +116,15 @@ export function App() {
   useEffect(() => {
     const events = new EventSource("/api/session/events");
 
+    events.addEventListener("session_snapshot", (event) => {
+      applySessionSnapshot(parseEvent<SessionSnapshot>(event));
+    });
+
     events.addEventListener("session_state", (event) => {
       const payload = parseEvent<SessionSnapshot>(event);
-      setSession(payload);
-      setStatus(`Сессия: ${payload.state}`);
+      applySessionSnapshot(payload);
+      const lastError = typeof payload.metrics.lastError === "string" ? payload.metrics.lastError : "";
+      setStatus(payload.state === "degraded" ? lastError || "Сессия работает с ограничениями" : `Сессия: ${payload.state}`);
     });
 
     events.addEventListener("transcript", (event) => {
@@ -120,26 +134,33 @@ export function App() {
 
     events.addEventListener("question", (event) => {
       const payload = parseEvent<QuestionEvent>(event);
+      activeQuestionId.current = payload.questionId;
       setCurrentQuestion(payload.question);
       setAnswer("");
       setStatus("Вопрос найден");
     });
 
     events.addEventListener("answer_delta", (event) => {
-      const payload = parseEvent<{ deltaText: string }>(event);
+      const payload = parseEvent<{ questionId: string; deltaText: string }>(event);
+      if (payload.questionId !== activeQuestionId.current) return;
       setAnswer((current) => current + payload.deltaText);
     });
 
-    events.addEventListener("answer_done", () => {
+    events.addEventListener("answer_done", (event) => {
+      const payload = parseEvent<{ questionId: string }>(event);
+      if (payload.questionId !== activeQuestionId.current) return;
       setStatus("Ответ готов");
     });
 
-    events.addEventListener("answer_cancelled", () => {
+    events.addEventListener("answer_cancelled", (event) => {
+      const payload = parseEvent<{ questionId: string }>(event);
+      if (payload.questionId !== activeQuestionId.current) return;
       setStatus("Предыдущий ответ отменен");
     });
 
     events.addEventListener("answer_error", (event) => {
-      const payload = parseEvent<{ error: string }>(event);
+      const payload = parseEvent<{ questionId: string; error: string }>(event);
+      if (payload.questionId !== activeQuestionId.current) return;
       setStatus(payload.error);
     });
 
@@ -192,11 +213,28 @@ export function App() {
     });
 
     events.onerror = () => {
-      setStatus("Жду события сессии");
+      setStatus("Нет связи с сервером событий");
+    };
+
+    events.onopen = () => {
+      setStatus((current) => current === "Нет связи с сервером событий" ? "Сервер событий подключен" : current);
     };
 
     return () => events.close();
   }, []);
+
+  function applySessionSnapshot(snapshot: SessionSnapshot) {
+    setSession(snapshot);
+    setTurns(snapshot.memory.turns);
+    const question = snapshot.currentQuestion;
+    activeQuestionId.current = question?.questionId ?? "";
+    setCurrentQuestion(question?.question ?? "");
+    setAnswer(
+      question && snapshot.currentAnswer.questionId === question.questionId
+        ? snapshot.currentAnswer.text
+        : ""
+    );
+  }
 
   const providerIcon = useMemo(() => {
     return config.llmProvider === "ollama" ? <Server size={18} /> : <Cloud size={18} />;
@@ -220,11 +258,31 @@ export function App() {
   }
 
   function handleProviderChange(provider: Provider) {
+    const nextMode: AudioMode = provider === "ollama"
+      ? "local_vosk"
+      : config.audioMode === "local_vosk"
+        ? "yandex_realtime"
+        : config.audioMode;
     setConfig({
       ...config,
       llmProvider: provider,
-      llmModel: defaultModelForProvider(provider, modelsByProvider)
+      llmModel: defaultModelForProvider(provider, modelsByProvider),
+      audioMode: nextMode
     });
+    setAudioMode(nextMode);
+  }
+
+  function handleAudioModeChange(mode: AudioMode) {
+    const provider: Provider = mode === "local_vosk" ? "ollama" : "yandex_ai_studio";
+    setConfig({
+      ...config,
+      audioMode: mode,
+      llmProvider: provider,
+      llmModel: provider === config.llmProvider
+        ? config.llmModel
+        : defaultModelForProvider(provider, modelsByProvider)
+    });
+    setAudioMode(mode);
   }
 
   function updateHotkey(name: keyof AppConfig["hotkeys"], value: string) {
@@ -290,6 +348,7 @@ export function App() {
       setAudioRunning(false);
       setAudioLevels(emptyAudioLevels());
       setTurns([]);
+      activeQuestionId.current = "";
       setCurrentQuestion("");
       setAnswer("");
       setStatus("Сессия на паузе");
@@ -309,17 +368,17 @@ export function App() {
     try {
       setAudioLevels(emptyAudioLevels());
       const deviceIds = recommendedDeviceIds(audioDevices, sources);
-      const preflight = await preflightLiveAudio(sources, deviceIds, audioMode);
+      const preflight = await preflightLiveAudio(sources, deviceIds, config.audioMode);
       if (!preflight.ok) {
         setStatus(preflight.errors[0] || "Проверка звука не прошла");
         return;
       }
-      const snapshot = await startLiveAudio(sources, deviceIds, audioMode);
+      const snapshot = await startLiveAudio(sources, deviceIds, config.audioMode);
       if (snapshot.mode && isAudioMode(snapshot.mode)) {
         setAudioMode(snapshot.mode);
       }
       setAudioRunning(snapshot.running);
-      setStatus(`Звук слушается: ${(snapshot.mode ?? audioMode).replace("_", " ")} ${snapshot.sources.join(" + ")}`);
+      setStatus(`Звук слушается: ${(snapshot.mode ?? config.audioMode).replace("_", " ")} ${snapshot.sources.join(" + ")}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Не удалось запустить звук");
     } finally {
@@ -361,6 +420,18 @@ export function App() {
               <option key={model.id} value={model.id}>
                 {modelLabel(model)}
               </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
+          Обработка звука
+          <select
+            value={config.audioMode}
+            onChange={(event) => handleAudioModeChange(event.target.value as AudioMode)}
+          >
+            {(Object.keys(AUDIO_MODE_NAMES) as AudioMode[]).map((mode) => (
+              <option key={mode} value={mode}>{AUDIO_MODE_NAMES[mode]}</option>
             ))}
           </select>
         </label>
@@ -504,7 +575,7 @@ export function App() {
         <StatusItem label="Приложение" value={audioRunning ? "включено" : "выключено"} active={audioRunning} />
         <StatusItem label="Нейронка" value={aiStatusLabel(config, audioRunning)} active={isAiConfigured(config)} />
         <StatusItem label="Режим" value={audioModeLabel(audioMode)} active={audioRunning} />
-        <StatusItem label="Состояние" value={status} active={!status.toLowerCase().includes("ошибка")} />
+        <StatusItem label="Состояние" value={status} active={statusIsHealthy(status)} />
         <button className={audioRunning ? "listen-toggle danger" : "listen-toggle primary"} onClick={handleToggleLiveAudio} disabled={busy}>
           {busy ? <Loader2 className="spin" size={16} /> : audioRunning ? <Pause size={16} /> : <Play size={16} />}
           {audioRunning ? "Пауза" : "Включить"}
@@ -684,7 +755,13 @@ function setupValidationMessage(config: AppConfig, apiKey: string): string | nul
   if (!config.hotkeys.overlayToggle.trim() || !config.hotkeys.audioToggle.trim()) {
     return "Укажите горячие клавиши.";
   }
-  if (config.llmProvider === "yandex_ai_studio") {
+  if (config.audioMode === "local_vosk" && config.llmProvider !== "ollama") {
+    return "Для локального звука выберите Ollama.";
+  }
+  if (config.audioMode !== "local_vosk" && config.llmProvider !== "yandex_ai_studio") {
+    return "Для облачного звука выберите Яндекс.";
+  }
+  if (config.llmProvider === "yandex_ai_studio" || config.audioMode !== "local_vosk") {
     if (!config.yandexFolderId.trim()) {
       return "Укажите папку Yandex Cloud.";
     }
@@ -715,4 +792,19 @@ function isAudioSource(source: string): source is AudioSource {
 
 function isAudioMode(mode: string): mode is AudioMode {
   return mode === "yandex_realtime" || mode === "speechkit" || mode === "local_vosk";
+}
+
+function statusIsHealthy(status: string): boolean {
+  const value = status.toLowerCase();
+  return ![
+    "ошибка",
+    "нет связи",
+    "error",
+    "failed",
+    "missing",
+    "not found",
+    "unavailable",
+    "degraded",
+    "ограничениями"
+  ].some((marker) => value.includes(marker));
 }
