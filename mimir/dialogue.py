@@ -63,10 +63,10 @@ class ContextSnapshot:
     confidence: float = 0.0
 
     def to_prompt_text(self) -> str:
-        blocks = [
-            f"Текущий вопрос собеседника:\n{self.question}",
-            f"Текущая тема:\n{self.active_topic or 'не определена'}",
-        ]
+        return f"Текущий вопрос собеседника:\n{self.question}\n\n{self.to_background_text()}"
+
+    def to_background_text(self) -> str:
+        blocks = [f"Текущая тема:\n{self.active_topic or 'не определена'}"]
         if self.related_exchanges:
             blocks.append("Связанные вопросы, подсказки и ответы пользователя:\n" + "\n\n".join(self.related_exchanges))
         elif self.relevant_prior_questions:

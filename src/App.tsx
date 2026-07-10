@@ -54,9 +54,10 @@ const PROVIDER_NAMES: Record<Provider, string> = {
 
 const AUDIO_MODE_NAMES: Record<AudioMode, string> = {
   yandex_realtime: "Яндекс Realtime — минимальная задержка",
-  speechkit: "SpeechKit — через расшифровку",
+  speechkit: "SpeechKit — запасной облачный путь",
   local_vosk: "Локально — Vosk и Ollama"
 };
+const SELECTABLE_AUDIO_MODES: AudioMode[] = ["yandex_realtime", "local_vosk"];
 
 interface AudioLevel {
   rms: number;
@@ -430,7 +431,7 @@ export function App() {
             value={config.audioMode}
             onChange={(event) => handleAudioModeChange(event.target.value as AudioMode)}
           >
-            {(Object.keys(AUDIO_MODE_NAMES) as AudioMode[]).map((mode) => (
+            {SELECTABLE_AUDIO_MODES.map((mode) => (
               <option key={mode} value={mode}>{AUDIO_MODE_NAMES[mode]}</option>
             ))}
           </select>
@@ -720,7 +721,7 @@ function audioModeLabel(mode: AudioMode): string {
     return "локально";
   }
   if (mode === "speechkit") {
-    return "SpeechKit";
+    return "SpeechKit, запасной";
   }
   return "Realtime API";
 }

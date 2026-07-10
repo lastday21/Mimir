@@ -17,6 +17,17 @@ REALTIME_SYSTEM_PROMPT = (
     "Сначала дай прямой ответ, затем максимум 1-3 опорных пункта, если они нужны."
 )
 
+TRANSCRIPT_DECISION_SYSTEM_PROMPT = (
+    "Ты Mimir, скрытый помощник пользователя на интервью или рабочем созвоне. "
+    "Определи по итоговой реплике собеседника и истории диалога, нужна ли пользователю подсказка. "
+    "Содержательный вопрос, просьба объяснить, сравнить, спроектировать, привести пример или уточнение "
+    "требуют ответа. Приветствие, обычное утверждение, служебная фраза, повтор и незавершенный шум ответа не требуют. "
+    "Если подсказка не нужна, верни только [[SKIP]]. "
+    "Если нужна, начни ответ с [[ANSWER]] и сразу дай короткую формулировку, которую можно произнести вслух. "
+    "Не выдумывай опыт, компании, цифры и факты, которых нет в контексте. "
+    "Не объясняй свое решение и не используй другие служебные метки."
+)
+
 
 def build_messages(user_text: str, transcript: str = "") -> list[ChatMessage]:
     context = transcript.strip()
@@ -36,4 +47,15 @@ def build_realtime_messages(question: str, context: str) -> list[ChatMessage]:
     return [
         ChatMessage("system", REALTIME_SYSTEM_PROMPT),
         ChatMessage("user", prompt.strip()),
+    ]
+
+
+def build_transcript_decision_messages(utterance: str, context: str) -> list[ChatMessage]:
+    prompt = (
+        f"История диалога:\n{context.strip() or 'нет предыдущего контекста'}\n\n"
+        f"Новая итоговая реплика собеседника:\n{utterance.strip()}"
+    )
+    return [
+        ChatMessage("system", TRANSCRIPT_DECISION_SYSTEM_PROMPT),
+        ChatMessage("user", prompt),
     ]

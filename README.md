@@ -47,17 +47,17 @@ The backend exposes a session API:
 audio. The default `yandex_realtime` mode streams remote loopback audio directly
 to Yandex AI Studio Realtime API and sends the recent role-labeled dialogue as
 `DIALOGUE_CONTEXT`, so the assistant answers the other speaker and treats the
-user's speech as dialogue history. `speechkit` mode remains available as a
-fallback that sends both sources through the local SpeechKit transcript bus.
-`local_vosk` mode is the offline path: local Vosk transcription feeds the same
-session memory/question detector, while answers are forced through Ollama.
-The settings screen exposes all three audio modes and keeps the local mode paired
-with Ollama so the displayed configuration matches the runtime path.
+user's speech as dialogue history. `speechkit` mode remains available as an
+internal cloud fallback that sends both sources through the SpeechKit transcript
+bus. In transcript-based paths, the selected answer model decides in the same
+request whether to skip the utterance or stream a hint; there is no separate
+word-list question detector. `local_vosk` is the offline path: local Vosk
+transcription feeds the same model decision flow, while answers are forced
+through Ollama. The settings screen exposes only Realtime and fully local modes.
 
-If Yandex Realtime fails while starting or running, Mimir switches to
-`local_vosk` with the same audio sources. This fallback is intended for quota or
-token exhaustion cases where the call itself is still online but the Realtime
-API cannot be used.
+If Yandex Realtime fails while starting or running, Mimir first switches both
+sources to SpeechKit. If that cloud path also fails, it switches to `local_vosk`
+and Ollama with the same audio sources.
 
 `/api/session/transcript` remains a development input for direct transcript
 injection.

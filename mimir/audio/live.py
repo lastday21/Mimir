@@ -39,6 +39,7 @@ class PcmSource(Protocol):
 
 RecognizerFactory = Callable[[str], StreamingRecognizer]
 PcmSourceFactory = Callable[[str, AudioCaptureConfig], PcmSource]
+LiveAudioFallbackStarter = Callable[["LiveAudioConfig", str], object]
 
 
 @dataclass(frozen=True)
@@ -61,18 +62,21 @@ class LiveAudioController:
         *,
         mode: str = "speechkit",
         requires_api_key: bool = True,
+        fallback_starter: LiveAudioFallbackStarter | None = None,
     ) -> None:
         self.session = session
         self.recognizer_factory = recognizer_factory
         self.source_factory = source_factory or default_source_factory
         self.mode = mode
         self.requires_api_key = requires_api_key
+        self.fallback_starter = fallback_starter
         self._lock = threading.Lock()
         self._stop_event: threading.Event | None = None
         self._threads: dict[str, threading.Thread] = {}
         self._active_sources: set[str] = set()
         self._running = False
         self._config: LiveAudioConfig | None = None
+        self._fallback_started = False
 
     def start(self, config: LiveAudioConfig, api_key: str) -> dict[str, object]:
         key = api_key.strip()
@@ -98,6 +102,7 @@ class LiveAudioController:
                 device_ids=dict(config.device_ids),
             )
             self._running = True
+            self._fallback_started = False
 
         self.session.start()
         trace_live_event(
@@ -231,7 +236,8 @@ class LiveAudioController:
                 {"source": source, "mode": self.mode, "error": str(error), "running": self.snapshot()["running"]},
             )
             if source == REMOTE_SOURCE:
-                self.mark_degraded("remote_producer", str(error))
+                if not self._start_fallback(str(error)):
+                    self.mark_degraded("remote_producer", str(error))
         finally:
             self._finish_source(source)
 
@@ -308,6 +314,35 @@ class LiveAudioController:
         marker = getattr(self.session, "mark_degraded", None)
         if callable(marker):
             marker(phase, error)
+
+    def _start_fallback(self, reason: str) -> bool:
+        if self.fallback_starter is None:
+            return False
+        with self._lock:
+            if self._fallback_started or self._config is None:
+                return self._fallback_started
+            self._fallback_started = True
+            config = self._config
+
+        def run_fallback() -> None:
+            try:
+                self.fallback_starter(config, reason)
+            except Exception as error:
+                trace_live_event("audio.fallback_error", mode="local_vosk", error=str(error))
+                self.publish(
+                    "audio_error",
+                    {
+                        "source": REMOTE_SOURCE,
+                        "mode": "local_vosk",
+                        "phase": "fallback",
+                        "error": str(error),
+                        "running": False,
+                    },
+                )
+                self.mark_degraded("fallback", str(error))
+
+        threading.Thread(target=run_fallback, name="mimir-local-audio-fallback", daemon=True).start()
+        return True
 
 
 def default_source_factory(source: str, config: AudioCaptureConfig) -> SoundcardPcmSource:

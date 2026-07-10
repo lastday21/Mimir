@@ -116,6 +116,34 @@ class FakeSoundcard:
 
 
 class AudioPipelineTests(unittest.TestCase):
+    def test_speechkit_controller_falls_back_when_remote_recognition_fails(self) -> None:
+        session = FakeSession()
+        fallback_called = threading.Event()
+        fallback_reasons: list[str] = []
+
+        class FailingRecognizer:
+            def stream_lpcm(self, _chunks, *, language: str, sample_rate_hertz: int):
+                raise RuntimeError("speechkit stream lost")
+
+        def fallback_starter(_config: LiveAudioConfig, reason: str) -> None:
+            fallback_reasons.append(reason)
+            fallback_called.set()
+
+        controller = LiveAudioController(
+            session,
+            lambda _key: FailingRecognizer(),
+            lambda _source, _config: FakePcmSource([pcm_constant(1000, 1600)]),
+            fallback_starter=fallback_starter,
+        )
+
+        controller.start(
+            LiveAudioConfig(sources=("remote",), vad_enabled=False),
+            "test-key",
+        )
+
+        self.assertTrue(fallback_called.wait(2))
+        self.assertEqual(fallback_reasons, ["speechkit stream lost"])
+
     @unittest.skipUnless(os.name == "nt", "Windows audio regression")
     def test_lists_audio_devices_from_separate_windows_threads(self) -> None:
         errors: list[Exception] = []

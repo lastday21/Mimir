@@ -34,7 +34,11 @@ PORT = 8765
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "dist"
 ALLOWED_CORS_HEADERS = "Content-Type"
 SESSION_MANAGER = SessionManager()
-LIVE_AUDIO = LiveAudioController(SESSION_MANAGER, YandexSpeechKitClient)
+LIVE_AUDIO = LiveAudioController(
+    SESSION_MANAGER,
+    YandexSpeechKitClient,
+    fallback_starter=lambda config, reason: start_local_audio_fallback(config, reason),
+)
 LOCAL_AUDIO = LiveAudioController(
     SESSION_MANAGER,
     lambda _key: LocalVoskRecognizer(),
@@ -44,7 +48,7 @@ LOCAL_AUDIO = LiveAudioController(
 REALTIME_AUDIO = RealtimeAudioController(
     SESSION_MANAGER,
     YandexSpeechKitClient,
-    fallback_starter=lambda config, reason: start_local_audio_fallback(config, reason),
+    fallback_starter=lambda config, reason: start_cloud_audio_fallback(config, reason),
 )
 AUDIO_CONTROL_LOCK = threading.RLock()
 MAX_DEV_WAV_BYTES = 25_000_000
@@ -331,7 +335,7 @@ def start_live_audio_locked(payload: dict[str, Any]) -> dict[str, object]:
     try:
         return REALTIME_AUDIO.start(RealtimeAudioConfig(**common_config), key, config.yandex_folder_id)
     except ProviderError as error:
-        return start_local_audio_fallback_locked(RealtimeAudioConfig(**common_config), str(error))
+        return start_cloud_audio_fallback_locked(RealtimeAudioConfig(**common_config), str(error))
 
 
 def config_payload(config: AppConfig) -> dict[str, Any]:
@@ -608,12 +612,41 @@ def idle_audio_snapshot() -> dict[str, object]:
     }
 
 
-def start_local_audio_fallback(config: RealtimeAudioConfig, reason: str) -> dict[str, object]:
+def start_cloud_audio_fallback(config: RealtimeAudioConfig, reason: str) -> dict[str, object]:
+    with AUDIO_CONTROL_LOCK:
+        return start_cloud_audio_fallback_locked(config, reason)
+
+
+def start_cloud_audio_fallback_locked(config: RealtimeAudioConfig, reason: str) -> dict[str, object]:
+    stop_all_audio_locked()
+    SESSION_MANAGER.set_answer_provider_override(None)
+    SESSION_MANAGER.publish_status(
+        "audio_status",
+        {
+            "status": "fallback",
+            "mode": "speechkit",
+            "source": "remote",
+            "reason": reason,
+            "running": True,
+        },
+    )
+    key = read_secret("yandex_speechkit") or read_secret("yandex_ai_studio") or ""
+    try:
+        return LIVE_AUDIO.start(copy_live_audio_config(config), key)
+    except Exception as error:
+        combined_reason = f"Realtime: {reason}. SpeechKit: {error}"
+        return start_local_audio_fallback_locked(config, combined_reason)
+
+
+def start_local_audio_fallback(config: RealtimeAudioConfig | LiveAudioConfig, reason: str) -> dict[str, object]:
     with AUDIO_CONTROL_LOCK:
         return start_local_audio_fallback_locked(config, reason)
 
 
-def start_local_audio_fallback_locked(config: RealtimeAudioConfig, reason: str) -> dict[str, object]:
+def start_local_audio_fallback_locked(
+    config: RealtimeAudioConfig | LiveAudioConfig,
+    reason: str,
+) -> dict[str, object]:
     stop_all_audio_locked()
     SESSION_MANAGER.set_answer_provider_override("ollama")
     SESSION_MANAGER.publish_status(
@@ -626,17 +659,18 @@ def start_local_audio_fallback_locked(config: RealtimeAudioConfig, reason: str) 
             "running": True,
         },
     )
-    return LOCAL_AUDIO.start(
-        LiveAudioConfig(
-            sources=config.sources,
-            language=config.language,
-            sample_rate_hertz=config.sample_rate_hertz,
-            chunk_duration_ms=config.chunk_duration_ms,
-            vad_enabled=config.vad_enabled,
-            vad=config.vad,
-            device_ids=dict(config.device_ids),
-        ),
-        "",
+    return LOCAL_AUDIO.start(copy_live_audio_config(config), "")
+
+
+def copy_live_audio_config(config: RealtimeAudioConfig | LiveAudioConfig) -> LiveAudioConfig:
+    return LiveAudioConfig(
+        sources=config.sources,
+        language=config.language,
+        sample_rate_hertz=config.sample_rate_hertz,
+        chunk_duration_ms=config.chunk_duration_ms,
+        vad_enabled=config.vad_enabled,
+        vad=config.vad,
+        device_ids=dict(config.device_ids),
     )
 
 

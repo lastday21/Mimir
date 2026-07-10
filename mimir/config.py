@@ -8,7 +8,7 @@ from pathlib import Path
 
 APP_DIR_NAME = "io.github.lastday21.mimir"
 CONFIG_FILE = "config.json"
-AUDIO_MODES = {"yandex_realtime", "speechkit", "local_vosk"}
+AUDIO_MODES = {"yandex_realtime", "local_vosk"}
 
 
 @dataclass
@@ -60,11 +60,14 @@ class AppConfig:
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
+        audio_mode = str(data["audio_mode"])
+        if audio_mode not in AUDIO_MODES:
+            audio_mode = "local_vosk" if data["llm_provider"] == "ollama" else "yandex_realtime"
         return {
             "yandexFolderId": data["yandex_folder_id"],
             "llmProvider": data["llm_provider"],
             "llmModel": data["llm_model"],
-            "audioMode": data["audio_mode"],
+            "audioMode": audio_mode,
             "ollamaBaseUrl": data["ollama_base_url"],
             "hotkeys": {
                 "overlayToggle": data["overlay_hotkey"],

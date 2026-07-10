@@ -26,10 +26,20 @@ class AppConfigTests(unittest.TestCase):
 
         self.assertEqual(config.audio_mode, "yandex_realtime")
 
-    def test_audio_mode_is_saved(self) -> None:
+    def test_old_speechkit_mode_migrates_to_realtime(self) -> None:
+        config = AppConfig.from_dict(
+            {
+                "llmProvider": "yandex_ai_studio",
+                "audioMode": "speechkit",
+            }
+        )
+
+        self.assertEqual(config.audio_mode, "yandex_realtime")
+
+    def test_internal_speechkit_mode_is_not_saved_as_user_choice(self) -> None:
         config = AppConfig(audio_mode="speechkit")
 
-        self.assertEqual(config.to_dict()["audioMode"], "speechkit")
+        self.assertEqual(config.to_dict()["audioMode"], "yandex_realtime")
 
 
 if __name__ == "__main__":

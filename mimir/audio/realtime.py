@@ -695,12 +695,12 @@ class RealtimeAudioController:
             try:
                 self.fallback_starter(config, reason)
             except Exception as error:
-                trace_live_event("audio.fallback_error", mode="local_vosk", error=str(error))
+                trace_live_event("audio.fallback_error", mode="fallback", error=str(error))
                 self.publish(
                     "audio_error",
                     {
                         "source": REMOTE_SOURCE,
-                        "mode": "local_vosk",
+                        "mode": "fallback",
                         "phase": "fallback",
                         "error": str(error),
                         "running": False,
@@ -708,7 +708,7 @@ class RealtimeAudioController:
                 )
                 self.mark_degraded("fallback", str(error))
 
-        threading.Thread(target=run_fallback, name="mimir-local-audio-fallback", daemon=True).start()
+        threading.Thread(target=run_fallback, name="mimir-audio-fallback", daemon=True).start()
         return True
 
     def mark_degraded(self, phase: str, error: str) -> None:

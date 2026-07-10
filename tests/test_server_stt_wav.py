@@ -119,6 +119,104 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             server.LOCAL_AUDIO = original_local_audio
             server.read_secret = original_read_secret
 
+    def test_realtime_start_failure_uses_speechkit_before_local_mode(self) -> None:
+        original_live_audio = server.LIVE_AUDIO
+        original_realtime_audio = server.REALTIME_AUDIO
+        original_local_audio = server.LOCAL_AUDIO
+        original_read_secret = server.read_secret
+        original_load_config = server.load_config
+        starts: list[str] = []
+
+        class FailingRealtime:
+            def start(self, *_args):
+                raise server.ProviderError("realtime unavailable")
+
+            def stop(self):
+                return {"running": False}
+
+            def snapshot(self):
+                return {"running": False}
+
+        class FakeAudio:
+            def __init__(self, mode: str) -> None:
+                self.mode = mode
+
+            def start(self, *_args):
+                starts.append(self.mode)
+                return {"running": True, "mode": self.mode, "sources": ["remote", "mic"]}
+
+            def stop(self):
+                return {"running": False}
+
+            def snapshot(self):
+                return {"running": False}
+
+        class FakeConfig:
+            yandex_folder_id = "folder-id"
+
+        server.REALTIME_AUDIO = FailingRealtime()
+        server.LIVE_AUDIO = FakeAudio("speechkit")
+        server.LOCAL_AUDIO = FakeAudio("local_vosk")
+        server.read_secret = lambda _name: "test-key"
+        server.load_config = lambda: FakeConfig()
+        try:
+            payload = server.start_live_audio(
+                {"mode": "yandex_realtime", "sources": ["remote", "mic"]}
+            )
+
+            self.assertEqual(payload["mode"], "speechkit")
+            self.assertEqual(starts, ["speechkit"])
+        finally:
+            server.LIVE_AUDIO = original_live_audio
+            server.REALTIME_AUDIO = original_realtime_audio
+            server.LOCAL_AUDIO = original_local_audio
+            server.read_secret = original_read_secret
+            server.load_config = original_load_config
+            server.SESSION_MANAGER.set_answer_provider_override(None)
+
+    def test_speechkit_start_failure_uses_local_mode(self) -> None:
+        original_live_audio = server.LIVE_AUDIO
+        original_realtime_audio = server.REALTIME_AUDIO
+        original_local_audio = server.LOCAL_AUDIO
+        original_read_secret = server.read_secret
+        starts: list[str] = []
+
+        class FakeController:
+            def __init__(self, mode: str, failing: bool = False) -> None:
+                self.mode = mode
+                self.failing = failing
+
+            def start(self, *_args):
+                starts.append(self.mode)
+                if self.failing:
+                    raise server.ProviderError("speechkit unavailable")
+                return {"running": True, "mode": self.mode, "sources": ["remote"]}
+
+            def stop(self):
+                return {"running": False}
+
+            def snapshot(self):
+                return {"running": False}
+
+        server.REALTIME_AUDIO = FakeController("yandex_realtime")
+        server.LIVE_AUDIO = FakeController("speechkit", failing=True)
+        server.LOCAL_AUDIO = FakeController("local_vosk")
+        server.read_secret = lambda _name: "test-key"
+        try:
+            payload = server.start_cloud_audio_fallback(
+                server.RealtimeAudioConfig(sources=("remote",)),
+                "realtime unavailable",
+            )
+
+            self.assertEqual(payload["mode"], "local_vosk")
+            self.assertEqual(starts, ["speechkit", "local_vosk"])
+        finally:
+            server.LIVE_AUDIO = original_live_audio
+            server.REALTIME_AUDIO = original_realtime_audio
+            server.LOCAL_AUDIO = original_local_audio
+            server.read_secret = original_read_secret
+            server.SESSION_MANAGER.set_answer_provider_override(None)
+
     def test_audio_device_error_returns_json_response(self) -> None:
         original_list_audio_devices = server.list_audio_devices
         server.list_audio_devices = lambda: (_ for _ in ()).throw(RuntimeError("device failure"))
