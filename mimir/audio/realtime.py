@@ -22,18 +22,23 @@ from .vad import EnergyVadConfig, EnergyVadGate
 REALTIME_RECONNECT_LIMIT = 3
 REALTIME_RECONNECT_BASE_DELAY_SECONDS = 0.4
 REALTIME_DRAIN_IDLE_SECONDS = 0.2
-REALTIME_CONTEXT_TURNS = 12
-REALTIME_CONTEXT_CHARS = 1800
+REALTIME_CONTEXT_REFRESH_SECONDS = 1.0
+REALTIME_CONTEXT_TURNS = 16
+REALTIME_CONTEXT_CHARS = 3600
 
 REALTIME_INSTRUCTIONS = """
 Ты скрытый realtime-помощник пользователя на интервью или рабочем созвоне.
 Ты не участник созвона и не отвечаешь собеседнику напрямую.
 
 Ты слышишь напрямую только remote: речь собеседника.
-DIALOGUE_CONTEXT - это фоновая история последних реплик с ролями. Это не вопрос к тебе.
+DIALOGUE_CONTEXT - это фоновая история с общей сводкой и последними репликами с ролями.
+Это не вопрос к тебе. Более новое сообщение DIALOGUE_CONTEXT заменяет предыдущую версию контекста.
 
 Отвечай только если remote задал пользователю содержательный вопрос, попросил объяснить, сравнить,
 спроектировать, привести пример или уточнил предыдущую тему.
+
+На обычной рабочей встрече также отвечай, если от пользователя ждут решения, подтверждения,
+срока, следующего действия или реакции на поручение.
 
 Если remote не задал полезный вопрос, не генерируй подсказку.
 
@@ -74,6 +79,9 @@ class RealtimeSessionSink(Protocol):
         ...
 
     def realtime_context(self, max_turns: int = 12, max_chars: int = 1800) -> str:
+        ...
+
+    def realtime_instructions(self, base: str) -> str:
         ...
 
 
@@ -306,7 +314,8 @@ class RealtimeAudioController:
         stop_event: threading.Event,
     ) -> None:
         async with self.realtime_factory(realtime_config) as client:
-            await client.setup_session(REALTIME_INSTRUCTIONS, config.sample_rate_hertz)
+            instructions = self._latest_realtime_instructions()
+            await client.setup_session(instructions, config.sample_rate_hertz)
             with self._lock:
                 self._last_dialogue_context = ""
             self._enqueue_dialogue_context_now(queue, "session")
@@ -428,17 +437,26 @@ class RealtimeAudioController:
         queue: asyncio.Queue[RealtimeQueueItem],
         stop_event: threading.Event,
     ) -> None:
+        last_context_refresh = time.monotonic()
         while not stop_event.is_set():
             try:
                 kind, _source, payload = await asyncio.wait_for(queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
-                continue
+                kind, _source, payload = "", "", b""
             if kind == "remote_audio" and isinstance(payload, bytes):
                 trace_live_event("realtime.remote.send", bytes=len(payload))
                 await client.append_audio(payload)
             elif kind == "dialogue_context" and isinstance(payload, str):
                 trace_live_event("realtime.dialogue_context.send", source=_source, chars=len(payload))
                 await client.add_dialogue_context(payload)
+
+            now = time.monotonic()
+            if now - last_context_refresh >= REALTIME_CONTEXT_REFRESH_SECONDS:
+                context = self._take_dialogue_context_update()
+                if context:
+                    trace_live_event("realtime.dialogue_context.send", source="summary", chars=len(context))
+                    await client.add_dialogue_context(context)
+                last_context_refresh = now
 
     async def _receive_events(
         self,
@@ -601,6 +619,12 @@ class RealtimeAudioController:
         if not callable(builder):
             return ""
         return str(builder(max_turns=REALTIME_CONTEXT_TURNS, max_chars=REALTIME_CONTEXT_CHARS)).strip()
+
+    def _latest_realtime_instructions(self) -> str:
+        builder = getattr(self.session, "realtime_instructions", None)
+        if not callable(builder):
+            return REALTIME_INSTRUCTIONS
+        return str(builder(REALTIME_INSTRUCTIONS)).strip() or REALTIME_INSTRUCTIONS
 
     def _put(
         self,

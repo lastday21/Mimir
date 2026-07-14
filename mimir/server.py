@@ -363,6 +363,9 @@ def config_payload(config: AppConfig) -> dict[str, Any]:
         "llmModel": config.llm_model,
         "audioMode": config.audio_mode,
         "ollamaBaseUrl": config.ollama_base_url,
+        "profile": config.profile.to_dict(),
+        "conversation": config.conversation.to_dict(),
+        "setupCompleted": config.setup_completed,
         "hasYandexKey": bool(read_secret("yandex_ai_studio")),
         "hotkeys": {
             "overlayToggle": config.overlay_hotkey,

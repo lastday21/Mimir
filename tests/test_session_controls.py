@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import unittest
 from http.client import HTTPConnection
 
@@ -82,6 +83,31 @@ class SessionControlTests(unittest.TestCase):
         self.assertTrue(payload["skipped"])
         self.assertEqual(payload["reason"], "paused")
         self.assertEqual(manager.snapshot()["memory"]["turns"], [])
+
+    def test_summary_is_built_in_background_after_six_final_turns(self) -> None:
+        class SummarySessionManager(SessionManager):
+            def _stream_answer(self, _messages):
+                yield "Команда обсуждает выпуск. Пользователь должен проверить сборку сегодня."
+
+        manager = SummarySessionManager()
+        manager.start()
+        for index in range(6):
+            source = "remote" if index % 2 == 0 else "mic"
+            manager.ingest_transcript(source, f"Итоговая реплика {index}", detect_question=False)
+
+        deadline = time.monotonic() + 2
+        summary = ""
+        while time.monotonic() < deadline:
+            summary = str(manager.snapshot()["memory"]["summary"])
+            if summary:
+                break
+            time.sleep(0.01)
+
+        self.assertIn("Пользователь должен проверить сборку", summary)
+        manager.ingest_transcript("remote", "Какой текущий срок?", detect_question=False)
+        context = manager.realtime_context(max_turns=12, max_chars=800)
+        self.assertIn("Сжатая сводка разговора", context)
+        self.assertIn("Собеседник: Какой текущий срок?", context)
 
 
 class ServerSessionControlTests(unittest.TestCase):

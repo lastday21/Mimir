@@ -1,5 +1,20 @@
 export type Provider = "yandex_ai_studio" | "ollama";
 export type AudioMode = "yandex_realtime" | "speechkit" | "local_vosk";
+export type ConversationMode = "interview" | "meeting" | "technical" | "custom";
+
+export interface UserProfile {
+  name: string;
+  role: string;
+  background: string;
+  projects: string;
+  stories: string;
+}
+
+export interface ConversationSettings {
+  mode: ConversationMode;
+  goal: string;
+  context: string;
+}
 
 export interface AppConfig {
   yandexFolderId: string;
@@ -8,6 +23,9 @@ export interface AppConfig {
   audioMode: AudioMode;
   ollamaBaseUrl: string;
   hasYandexKey: boolean;
+  profile: UserProfile;
+  conversation: ConversationSettings;
+  setupCompleted: boolean;
   hotkeys: {
     overlayToggle: string;
     audioToggle: string;

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 REMOTE_SOURCE = "remote"
 MIC_SOURCE = "mic"
 MIN_MEMORY_WINDOW_MS = 5 * 60 * 1000
+SUMMARY_MAX_SOURCE_CHARS = 6000
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,9 @@ class DialogueMemory:
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._pending_interim: dict[str, str] = {}
         self._latest_final: dict[str, str] = {}
+        self._summary = ""
+        self._summary_through_turn_id = ""
+        self._summary_through_timestamp_ms = 0
 
     def append(self, turn: DialogueTurn, *, refine_latest: bool = False) -> TranscriptUpdate | None:
         text = turn.text.strip()
@@ -197,28 +201,71 @@ class DialogueMemory:
 
     def realtime_context(self, max_turns: int = 12, max_chars: int = 1800) -> str:
         self._prune()
-        lines = [format_turn(turn) for turn in self.turns if turn.is_final][-max_turns:]
-        if not lines:
-            return ""
+        final_turns = [turn for turn in self.turns if turn.is_final]
+        if self._summary:
+            summary_index = next(
+                (
+                    index
+                    for index, turn in enumerate(final_turns)
+                    if turn.turn_id == self._summary_through_turn_id
+                ),
+                None,
+            )
+            if summary_index is not None:
+                final_turns = final_turns[summary_index + 1 :]
+            elif self._summary_through_timestamp_ms:
+                final_turns = [
+                    turn
+                    for turn in final_turns
+                    if turn.timestamp_ms > self._summary_through_timestamp_ms
+                ]
 
-        selected: list[str] = []
-        current_len = 0
-        for line in reversed(lines):
-            extra = 1 if selected else 0
-            if not selected and len(line) > max_chars:
-                selected.append(line[:max_chars].rstrip())
-                break
-            if selected and current_len + extra + len(line) > max_chars:
-                break
-            selected.append(line)
-            current_len += extra + len(line)
-        return "\n".join(reversed(selected))
+        lines = [format_turn(turn) for turn in final_turns][-max_turns:]
+        recent_limit = max_chars // 2 if self._summary else max_chars
+        recent = select_recent_lines(lines, recent_limit)
+        if not self._summary:
+            return recent
+
+        heading = "Сжатая сводка разговора:\n"
+        separator = "\n\nПоследние реплики:\n" if recent else ""
+        summary_limit = max_chars - len(heading) - len(separator) - len(recent)
+        if summary_limit <= 0:
+            return recent
+        summary = self._summary[:summary_limit].rstrip()
+        if not summary:
+            return recent
+        return f"{heading}{summary}{separator}{recent}".rstrip()
+
+    def summary_source(self, max_chars: int = SUMMARY_MAX_SOURCE_CHARS) -> tuple[str, str, int]:
+        self._prune()
+        final_turns = [turn for turn in self.turns if turn.is_final]
+        if not final_turns:
+            return "", "", 0
+        lines = [format_turn(turn) for turn in final_turns]
+        transcript = select_recent_lines(lines, max_chars)
+        last_turn = final_turns[-1]
+        return transcript, last_turn.turn_id, last_turn.timestamp_ms
+
+    def set_summary(self, text: str, through_turn_id: str, through_timestamp_ms: int) -> None:
+        normalized = text.strip()
+        if not normalized or not through_turn_id:
+            return
+        self._summary = normalized
+        self._summary_through_turn_id = through_turn_id
+        self._summary_through_timestamp_ms = through_timestamp_ms
+
+    @property
+    def summary(self) -> str:
+        return self._summary
 
     def payload(self) -> dict[str, object]:
         self._prune()
         return {
             "activeTopic": self.active_topic,
             "windowMs": self.retention_ms,
+            "summary": self._summary,
+            "summaryThroughTurnId": self._summary_through_turn_id,
+            "summaryThroughTimestampMs": self._summary_through_timestamp_ms,
             "turns": [
                 {
                     "turnId": turn.turn_id,
@@ -288,6 +335,23 @@ class DialogueMemory:
 def format_turn(turn: DialogueTurn) -> str:
     speaker = "Собеседник" if turn.source == REMOTE_SOURCE else "Пользователь"
     return f"{speaker}: {turn.text}"
+
+
+def select_recent_lines(lines: list[str], max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    selected: list[str] = []
+    current_len = 0
+    for line in reversed(lines):
+        extra = 1 if selected else 0
+        if not selected and len(line) > max_chars:
+            selected.append(line[:max_chars].rstrip())
+            break
+        if selected and current_len + extra + len(line) > max_chars:
+            break
+        selected.append(line)
+        current_len += extra + len(line)
+    return "\n".join(reversed(selected))
 
 
 def format_exchange(exchange: DialogueExchange) -> str:

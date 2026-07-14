@@ -31,6 +31,19 @@ const DEFAULT_CONFIG: AppConfig = {
   audioMode: "yandex_realtime",
   ollamaBaseUrl: "http://localhost:11434",
   hasYandexKey: false,
+  profile: {
+    name: "",
+    role: "",
+    background: "",
+    projects: "",
+    stories: ""
+  },
+  conversation: {
+    mode: "interview",
+    goal: "",
+    context: ""
+  },
+  setupCompleted: false,
   hotkeys: {
     overlayToggle: "Ctrl+M",
     audioToggle: "Ctrl+Space"
@@ -86,6 +99,9 @@ export function App() {
       .then((loaded) => {
         setConfig(loaded);
         setAudioMode(loaded.audioMode);
+        if (!IS_OVERLAY) {
+          setSetupOpen(!loaded.setupCompleted);
+        }
         setStatus("Сервер подключен");
       })
       .catch((error) => setStatus(error.message));
@@ -160,7 +176,8 @@ export function App() {
     }
     setBusy(true);
     try {
-      await persist();
+      const nextConfig = closeAfterSave ? { ...config, setupCompleted: true } : config;
+      await persist(nextConfig);
       if (closeAfterSave) {
         setSetupOpen(false);
         setStatus("Настройки готовы");
@@ -270,7 +287,7 @@ export function App() {
         <header className="app-header setup-header">
           <div>
             <h1>Mimir</h1>
-            <p>Сначала настройте провайдера, модель и доступ.</p>
+            <p>Настройте цель разговора, свой профиль, модель и доступ.</p>
           </div>
           <span className="status">{busy ? <Loader2 className="spin" size={16} /> : <Check size={16} />} {status}</span>
         </header>
@@ -330,7 +347,8 @@ export function App() {
       <section className="status-bar">
         <StatusItem label="Приложение" value={audioRunning ? "включено" : "выключено"} active={audioRunning} />
         <StatusItem label="Нейронка" value={aiStatusLabel(config, audioRunning)} active={isAiConfigured(config)} />
-        <StatusItem label="Режим" value={audioModeLabel(audioMode)} active={audioRunning} />
+        <StatusItem label="Разговор" value={conversationLabel(config)} active={Boolean(config.conversation.goal.trim())} />
+        <StatusItem label="Звук" value={audioModeLabel(audioMode)} active={audioRunning} />
         <StatusItem label="Состояние" value={status} active={statusIsHealthy(status)} />
         <button className={audioRunning ? "listen-toggle danger" : "listen-toggle primary"} onClick={handleToggleLiveAudio} disabled={busy}>
           {busy ? <Loader2 className="spin" size={16} /> : audioRunning ? <Pause size={16} /> : <Play size={16} />}
@@ -465,6 +483,22 @@ function audioModeLabel(mode: AudioMode): string {
   return "Realtime API";
 }
 
+function conversationLabel(config: AppConfig): string {
+  if (config.conversation.goal.trim()) {
+    return config.conversation.goal.trim();
+  }
+  if (config.conversation.mode === "meeting") {
+    return "обычная встреча";
+  }
+  if (config.conversation.mode === "technical") {
+    return "техническое обсуждение";
+  }
+  if (config.conversation.mode === "custom") {
+    return "своя цель";
+  }
+  return "собеседование";
+}
+
 function modelOptionsForProvider(
   config: AppConfig,
   modelsByProvider: Record<Provider, ModelInfo[]>
@@ -496,6 +530,9 @@ function selectedOrFirstModel(currentModel: string, models: ModelInfo[]): string
 }
 
 function setupValidationMessage(config: AppConfig, apiKey: string): string | null {
+  if (config.conversation.mode === "custom" && !config.conversation.goal.trim()) {
+    return "Опишите свою цель разговора.";
+  }
   if (!config.llmModel.trim()) {
     return "Выберите модель.";
   }

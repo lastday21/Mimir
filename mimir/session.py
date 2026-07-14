@@ -11,9 +11,11 @@ from .credentials import read_secret
 from .dialogue import MIC_SOURCE, REMOTE_SOURCE, DialogueMemory, DialogueTurn
 from .live_trace import trace_live_event
 from .models import ChatMessage
+from .prompts import build_realtime_session_instructions
 from .providers import OllamaClient, YandexAIStudioClient
 from .session_answer_flow import SessionAnswerFlow
 from .session_metrics import SessionMetrics
+from .session_summary import DialogueSummaryCoordinator
 from .session_types import (
     AnswerStreamChunk,
     SessionEvent,
@@ -47,6 +49,13 @@ class SessionManager(SessionAnswerFlow):
         self._answer_provider_override: str | None = None
         self._current_question: dict[str, Any] | None = None
         self._current_answer_text = ""
+        self._summary = DialogueSummaryCoordinator(
+            self._stream_answer,
+            self.prompt_config,
+            self._apply_summary,
+            trace_live_event,
+        )
+        self._summary.reset(self._generation, self._session_id)
 
     def start(self) -> dict[str, Any]:
         with self._condition:
@@ -63,6 +72,7 @@ class SessionManager(SessionAnswerFlow):
             self._candidate_sequence = 0
             self._current_question = None
             self._current_answer_text = ""
+            self._summary.reset(self._generation, self._session_id)
             self.reset_metrics_locked()
             self._state = "listening"
             payload = self.snapshot_locked()
@@ -74,6 +84,7 @@ class SessionManager(SessionAnswerFlow):
         self._cancel_answer.set()
         with self._condition:
             self._generation += 1
+            self._summary.reset(self._generation, self._session_id)
             self._state = "stopped"
             payload = self.snapshot_locked()
             self.publish_locked("session_state", payload)
@@ -94,6 +105,7 @@ class SessionManager(SessionAnswerFlow):
             self._candidate_sequence = 0
             self._current_question = None
             self._current_answer_text = ""
+            self._summary.reset(self._generation, self._session_id)
             self.reset_metrics_locked()
             self._state = "paused"
             payload = self.snapshot_locked()
@@ -160,9 +172,17 @@ class SessionManager(SessionAnswerFlow):
                 detectQuestion=detect_question,
                 timestampMs=turn.timestamp_ms,
             )
+            summary_source = (
+                self._generation,
+                self._session_id,
+                self._memory.summary,
+                *self._memory.summary_source(),
+            ) if turn.is_final else None
 
         if detect_question and turn.source == REMOTE_SOURCE and turn.is_final and not is_refinement:
             self._consider_remote_utterance(turn.text, turn.timestamp_ms)
+        if summary_source is not None:
+            self._summary.observe(*summary_source)
         return payload
 
     def publish_status(self, event: str, payload: dict[str, Any]) -> None:
@@ -276,6 +296,9 @@ class SessionManager(SessionAnswerFlow):
                 return ""
             return self._memory.realtime_context(max_turns=max_turns, max_chars=max_chars)
 
+    def realtime_instructions(self, base: str) -> str:
+        return build_realtime_session_instructions(base, self.prompt_config())
+
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             return self.snapshot_locked()
@@ -333,6 +356,30 @@ class SessionManager(SessionAnswerFlow):
         self._active_question_id = ""
         self._cancelled_streams = 0
 
+    def _apply_summary(
+        self,
+        generation: int,
+        session_id: str,
+        summary: str,
+        through_turn_id: str,
+        through_timestamp_ms: int,
+        _requested_revision: int,
+    ) -> None:
+        with self._condition:
+            if generation != self._generation or session_id != self._session_id:
+                return
+            if self._state in {"paused", "stopped"}:
+                return
+            self._memory.set_summary(summary, through_turn_id, through_timestamp_ms)
+            self.publish_locked(
+                "context_summary",
+                {
+                    "sessionId": self._session_id,
+                    "text": summary,
+                    "throughTurnId": through_turn_id,
+                },
+            )
+
     def metrics_locked(self) -> dict[str, Any]:
         return self._metric_store.payload(
             current_question_id=self._active_question_id,
@@ -375,6 +422,10 @@ class SessionManager(SessionAnswerFlow):
         with self._condition:
             override = self._answer_provider_override
         return self.answer_provider().provider_name(override, config)
+
+    @staticmethod
+    def prompt_config() -> Any:
+        return load_config()
 
     @staticmethod
     def answer_provider() -> AnswerProviderGateway:

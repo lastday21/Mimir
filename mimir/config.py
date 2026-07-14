@@ -2,13 +2,57 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
 APP_DIR_NAME = "io.github.lastday21.mimir"
 CONFIG_FILE = "config.json"
 AUDIO_MODES = {"yandex_realtime", "local_vosk"}
+CONVERSATION_MODES = {"interview", "meeting", "technical", "custom"}
+
+
+@dataclass
+class UserProfile:
+    name: str = ""
+    role: str = ""
+    background: str = ""
+    projects: str = ""
+    stories: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "UserProfile":
+        return cls(
+            name=str(data.get("name") or ""),
+            role=str(data.get("role") or ""),
+            background=str(data.get("background") or ""),
+            projects=str(data.get("projects") or ""),
+            stories=str(data.get("stories") or ""),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass
+class ConversationSettings:
+    mode: str = "interview"
+    goal: str = ""
+    context: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "ConversationSettings":
+        mode = str(data.get("mode") or "interview").strip().lower()
+        if mode not in CONVERSATION_MODES:
+            mode = "interview"
+        return cls(
+            mode=mode,
+            goal=str(data.get("goal") or ""),
+            context=str(data.get("context") or ""),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
 
 
 @dataclass
@@ -20,11 +64,18 @@ class AppConfig:
     ollama_base_url: str = "http://localhost:11434"
     overlay_hotkey: str = "Ctrl+M"
     audio_hotkey: str = "Ctrl+Space"
+    profile: UserProfile = field(default_factory=UserProfile)
+    conversation: ConversationSettings = field(default_factory=ConversationSettings)
+    setup_completed: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "AppConfig":
         hotkeys = data.get("hotkeys")
         hotkey_data = hotkeys if isinstance(hotkeys, dict) else {}
+        profile = data.get("profile")
+        profile_data = profile if isinstance(profile, dict) else {}
+        conversation = data.get("conversation")
+        conversation_data = conversation if isinstance(conversation, dict) else {}
         provider = str(data.get("llmProvider") or data.get("llm_provider") or "yandex_ai_studio")
         default_audio_mode = "local_vosk" if provider == "ollama" else "yandex_realtime"
         audio_mode = str(data.get("audioMode") or data.get("audio_mode") or default_audio_mode)
@@ -56,6 +107,9 @@ class AppConfig:
                 or data.get("audio_hotkey")
                 or "Ctrl+Space"
             ),
+            profile=UserProfile.from_dict(profile_data),
+            conversation=ConversationSettings.from_dict(conversation_data),
+            setup_completed=data.get("setupCompleted") is True or data.get("setup_completed") is True,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -69,6 +123,9 @@ class AppConfig:
             "llmModel": data["llm_model"],
             "audioMode": audio_mode,
             "ollamaBaseUrl": data["ollama_base_url"],
+            "profile": self.profile.to_dict(),
+            "conversation": self.conversation.to_dict(),
+            "setupCompleted": self.setup_completed,
             "hotkeys": {
                 "overlayToggle": data["overlay_hotkey"],
                 "audioToggle": data["audio_hotkey"],

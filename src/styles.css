@@ -193,6 +193,29 @@ p {
   margin-bottom: 18px;
 }
 
+.settings-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  margin-bottom: 18px;
+  padding: 4px;
+  border: 1px solid #293241;
+  background: #0f141b;
+  border-radius: 8px;
+}
+
+.settings-tabs button {
+  border-color: transparent;
+  background: transparent;
+  color: #9da7b3;
+}
+
+.settings-tabs button.active {
+  border-color: #365a8f;
+  background: #202c3d;
+  color: #dbe9f8;
+}
+
 .session-panel {
   margin-bottom: 18px;
 }
@@ -203,6 +226,48 @@ p {
   gap: 8px;
   color: #d7e0ea;
   margin-bottom: 14px;
+}
+
+.settings-section {
+  margin-bottom: 18px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #293241;
+}
+
+.settings-subtitle {
+  margin-bottom: 12px;
+}
+
+.settings-subtitle-compact {
+  margin-top: 2px;
+}
+
+.settings-subtitle h3 {
+  margin: 0;
+  color: #d7e0ea;
+  font-size: 14px;
+}
+
+.settings-subtitle p {
+  margin-top: 5px;
+  color: #8ea0b5;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.context-settings-grid,
+.profile-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settings-wide-field {
+  grid-column: 1 / -1;
+}
+
+textarea.settings-textarea {
+  min-height: 88px;
 }
 
 .settings-grid {
@@ -260,6 +325,12 @@ textarea:focus {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 16px;
+}
+
+.model-settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
 }
 
 .setup-hint {
@@ -324,7 +395,7 @@ button:disabled {
 
 .status-bar {
   display: grid;
-  grid-template-columns: minmax(130px, 0.8fr) minmax(150px, 1fr) minmax(130px, 0.8fr) minmax(220px, 1.4fr) auto;
+  grid-template-columns: minmax(100px, 0.7fr) minmax(130px, 0.9fr) minmax(160px, 1.2fr) minmax(110px, 0.8fr) minmax(180px, 1.4fr) auto;
   align-items: stretch;
   gap: 10px;
 }

@@ -115,6 +115,39 @@ class DialogueMemoryTests(unittest.TestCase):
         self.assertIn("Пользователь: угу", context)
         self.assertIn("Пользователь: Я использовал Kafka", context)
 
+    def test_realtime_context_combines_summary_with_new_final_turns(self) -> None:
+        now = [1_000_000]
+        memory = DialogueMemory(clock_ms=lambda: now[0])
+        first = memory.append(DialogueTurn(REMOTE_SOURCE, "Обсуждаем выпуск версии", timestamp_ms=now[0]))
+        second = memory.append(DialogueTurn(MIC_SOURCE, "Я проверю сборку", timestamp_ms=now[0] + 1))
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        memory.set_summary(
+            "Команда готовит выпуск версии. Пользователь взял проверку сборки.",
+            second.turn.turn_id,
+            second.turn.timestamp_ms,
+        )
+        memory.append(DialogueTurn(REMOTE_SOURCE, "Срок — сегодня до шести", timestamp_ms=now[0] + 2))
+
+        context = memory.realtime_context(max_turns=4, max_chars=500)
+
+        self.assertIn("Сжатая сводка разговора", context)
+        self.assertIn("Пользователь взял проверку сборки", context)
+        self.assertIn("Последние реплики", context)
+        self.assertIn("Собеседник: Срок — сегодня до шести", context)
+        self.assertNotIn("Пользователь: Я проверю сборку", context)
+
+    def test_summary_source_contains_only_final_turns(self) -> None:
+        memory = DialogueMemory()
+        memory.append(DialogueTurn(REMOTE_SOURCE, "незаконченная", is_final=False))
+        final = memory.append(DialogueTurn(REMOTE_SOURCE, "Итоговая реплика"))
+        self.assertIsNotNone(final)
+
+        transcript, through_turn_id, _timestamp_ms = memory.summary_source()
+
+        self.assertEqual(transcript, "Собеседник: Итоговая реплика")
+        self.assertEqual(through_turn_id, final.turn.turn_id)
+
 
 if __name__ == "__main__":
     unittest.main()

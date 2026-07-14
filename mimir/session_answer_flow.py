@@ -73,7 +73,11 @@ class SessionAnswerFlow:
         context_done: float,
         context: ContextSnapshot,
     ) -> None:
-        messages = build_transcript_decision_messages(utterance, context.to_background_text())
+        messages = build_transcript_decision_messages(
+            utterance,
+            context.to_background_text(),
+            self.prompt_config(),
+        )
         decision_buffer = ""
         question_id = ""
         first_delta_at: float | None = None
@@ -408,7 +412,7 @@ class SessionAnswerFlow:
                 if generation != self._generation:
                     return
                 context = self._memory.build_context(self._session_id, question_id, question, confidence)
-            messages = build_realtime_messages(question, context.to_prompt_text())
+            messages = build_realtime_messages(question, context.to_prompt_text(), self.prompt_config())
             for item in self._stream_answer(messages):
                 chunk = answer_chunk(item, self.provider_name())
                 if cancel.is_set() or not self._generation_matches(generation):

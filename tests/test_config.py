@@ -1,6 +1,6 @@
 import unittest
 
-from mimir.config import AppConfig
+from mimir.config import AppConfig, ConversationSettings, UserProfile
 
 
 class AppConfigTests(unittest.TestCase):
@@ -40,6 +40,36 @@ class AppConfigTests(unittest.TestCase):
         config = AppConfig(audio_mode="speechkit")
 
         self.assertEqual(config.to_dict()["audioMode"], "yandex_realtime")
+
+    def test_profile_and_conversation_round_trip(self) -> None:
+        config = AppConfig(
+            profile=UserProfile(
+                name="Тимур",
+                role="Разработчик",
+                background="Пять лет в серверной разработке",
+                projects="Сервис обработки заказов",
+                stories="Ускорил очередь задач",
+            ),
+            conversation=ConversationSettings(
+                mode="meeting",
+                goal="Понимать, что от меня требуется",
+                context="Еженедельная встреча команды",
+            ),
+            setup_completed=True,
+        )
+
+        restored = AppConfig.from_dict(config.to_dict())
+
+        self.assertEqual(restored.profile.name, "Тимур")
+        self.assertEqual(restored.profile.projects, "Сервис обработки заказов")
+        self.assertEqual(restored.conversation.mode, "meeting")
+        self.assertEqual(restored.conversation.goal, "Понимать, что от меня требуется")
+        self.assertTrue(restored.setup_completed)
+
+    def test_unknown_conversation_mode_uses_interview(self) -> None:
+        config = AppConfig.from_dict({"conversation": {"mode": "unknown"}})
+
+        self.assertEqual(config.conversation.mode, "interview")
 
 
 if __name__ == "__main__":
