@@ -104,6 +104,8 @@ def idle_audio_snapshot() -> dict[str, object]:
         "chunkDurationMs": 200,
         "vadEnabled": True,
         "deviceIds": {},
+        "applicationProcessId": 0,
+        "recordTesting": False,
     }
 
 
@@ -138,7 +140,7 @@ def start_local_audio_fallback_locked(
     dependencies: AudioRuntimeDependencies,
 ) -> dict[str, object]:
     stop_all_audio_locked(dependencies)
-    dependencies.session_manager.set_answer_provider_override("ollama")
+    dependencies.session_manager.set_answer_provider_override(None)
     dependencies.session_manager.publish_status(
         "audio_status",
         {
@@ -161,4 +163,6 @@ def copy_live_audio_config(config: RealtimeAudioConfig | LiveAudioConfig) -> Liv
         vad_enabled=config.vad_enabled,
         vad=config.vad,
         device_ids=dict(config.device_ids),
+        application_process_id=config.application_process_id,
+        record_testing=config.record_testing,
     )

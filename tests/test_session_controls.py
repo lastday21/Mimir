@@ -9,6 +9,68 @@ from mimir.session import SessionManager
 
 
 class SessionControlTests(unittest.TestCase):
+    def test_cross_source_duplicate_prefers_remote_turn(self) -> None:
+        manager = SessionManager()
+        manager.start()
+
+        manager.ingest_transcript("mic", "Добрый день", detect_question=False)
+        manager.ingest_transcript("remote", "Добрый день", detect_question=False)
+
+        turns = manager.snapshot()["memory"]["turns"]
+        self.assertEqual([(turn["source"], turn["text"]) for turn in turns], [("remote", "Добрый день")])
+
+    def test_remote_partial_prevents_echo_from_becoming_user_answer(self) -> None:
+        manager = SessionManager()
+        manager.start()
+
+        manager.ingest_transcript(
+            "remote",
+            "Сколько будет пять плюс пять",
+            is_final=False,
+            detect_question=False,
+        )
+        result = manager.ingest_transcript(
+            "mic",
+            "Сколько будет 5 + 5",
+            detect_question=False,
+        )
+        manager.ingest_transcript(
+            "remote",
+            "Сколько будет 5 + 5",
+            detect_question=False,
+        )
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "cross_source_duplicate")
+        turns = manager.snapshot()["memory"]["turns"]
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["source"], "remote")
+
+    def test_cross_source_filter_keeps_different_numbers(self) -> None:
+        manager = SessionManager()
+        manager.start()
+
+        manager.ingest_transcript("remote", "Итоговая реплика 1", detect_question=False)
+        manager.ingest_transcript("mic", "Итоговая реплика 2", detect_question=False)
+
+        self.assertEqual(len(manager.snapshot()["memory"]["turns"]), 2)
+
+    def test_event_sink_receives_session_events_and_can_be_removed(self) -> None:
+        captured: list[tuple[str, dict[str, object]]] = []
+
+        def sink(event: str, payload: dict[str, object]) -> None:
+            captured.append((event, payload))
+
+        manager = SessionManager(sink)
+        manager.start()
+        manager.ingest_transcript("remote", "Проверка записи", detect_question=False)
+        manager.remove_event_sink(sink)
+        manager.ingest_transcript("mic", "После отключения", detect_question=False)
+
+        names = [event for event, _payload in captured]
+        self.assertIn("session_state", names)
+        self.assertEqual(names.count("transcript"), 1)
+
     def test_final_transcript_replaces_interim_in_event_and_snapshot(self) -> None:
         manager = SessionManager()
         manager.start()
@@ -111,6 +173,45 @@ class SessionControlTests(unittest.TestCase):
 
 
 class ServerSessionControlTests(unittest.TestCase):
+    def test_saving_config_refreshes_active_realtime_settings(self) -> None:
+        original_realtime_audio = server.REALTIME_AUDIO
+        original_save_config = server.save_config
+
+        class RefreshingAudio:
+            def __init__(self) -> None:
+                self.refresh_calls = 0
+
+            def refresh_settings(self) -> None:
+                self.refresh_calls += 1
+
+        realtime_audio = RefreshingAudio()
+        server.REALTIME_AUDIO = realtime_audio
+        server.save_config = lambda _config: None
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            status, _payload = post_json(
+                host,
+                port,
+                "/api/config",
+                {
+                    "conversation": {"mode": "meeting", "goal": "Понять новую задачу"},
+                    "hotkeys": {"overlayToggle": "Ctrl+M", "audioToggle": "Ctrl+Space"},
+                },
+            )
+
+            self.assertEqual(status, 200)
+            self.assertEqual(realtime_audio.refresh_calls, 1)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.REALTIME_AUDIO = original_realtime_audio
+            server.save_config = original_save_config
+
     def test_new_event_stream_starts_with_current_snapshot(self) -> None:
         original_session = server.SESSION_MANAGER
         manager = SessionManager()

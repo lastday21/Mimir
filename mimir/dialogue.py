@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import time
 import uuid
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 
 REMOTE_SOURCE = "remote"
@@ -134,6 +136,61 @@ class DialogueMemory:
             self._pending_interim[turn.source] = stored.turn_id
         self._refresh_active_topic()
         return TranscriptUpdate(stored, "append")
+
+    def find_cross_source_duplicate(
+        self,
+        turn: DialogueTurn,
+        *,
+        window_ms: int = 2_500,
+    ) -> DialogueTurn | None:
+        for current in reversed(self.turns):
+            if current.source == turn.source:
+                continue
+            if abs(turn.timestamp_ms - current.timestamp_ms) > window_ms:
+                continue
+            if transcripts_look_same(current.text, turn.text):
+                return current
+        return None
+
+    def remove_turn(self, turn_id: str) -> DialogueTurn | None:
+        index = self._turn_index(turn_id)
+        if index is None:
+            return None
+        removed = self.turns.pop(index)
+        if self._pending_interim.get(removed.source) == turn_id:
+            self._pending_interim.pop(removed.source, None)
+        if self._latest_final.get(removed.source) == turn_id:
+            previous = next(
+                (
+                    turn.turn_id
+                    for turn in reversed(self.turns)
+                    if turn.source == removed.source and turn.is_final
+                ),
+                "",
+            )
+            if previous:
+                self._latest_final[removed.source] = previous
+            else:
+                self._latest_final.pop(removed.source, None)
+        for exchange in self.exchanges:
+            exchange.user_turns = [turn for turn in exchange.user_turns if turn.turn_id != turn_id]
+        self._refresh_active_topic()
+        return removed
+
+    def remove_latest_matching_turn(
+        self,
+        source: str,
+        text: str,
+        *,
+        timestamp_ms: int,
+        window_ms: int = 2_500,
+    ) -> DialogueTurn | None:
+        for current in reversed(self.turns):
+            if abs(timestamp_ms - current.timestamp_ms) > window_ms:
+                continue
+            if current.source == source and transcripts_look_same(current.text, text):
+                return self.remove_turn(current.turn_id)
+        return None
 
     def remember_question(self, question_id: str, question: str, timestamp_ms: int | None = None) -> None:
         normalized = question.strip()
@@ -335,6 +392,55 @@ class DialogueMemory:
 def format_turn(turn: DialogueTurn) -> str:
     speaker = "Собеседник" if turn.source == REMOTE_SOURCE else "Пользователь"
     return f"{speaker}: {turn.text}"
+
+
+_SPOKEN_TOKEN_EQUIVALENTS = {
+    "ноль": "0",
+    "один": "1",
+    "одна": "1",
+    "два": "2",
+    "две": "2",
+    "три": "3",
+    "четыре": "4",
+    "пять": "5",
+    "шесть": "6",
+    "семь": "7",
+    "восемь": "8",
+    "девять": "9",
+    "плюс": "+",
+    "минус": "-",
+}
+
+
+def transcripts_look_same(left: str, right: str) -> bool:
+    left_tokens = normalize_transcript_tokens(left)
+    right_tokens = normalize_transcript_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    if min(len(left_tokens), len(right_tokens)) < 2 and min(len("".join(left_tokens)), len("".join(right_tokens))) < 8:
+        return False
+    if left_tokens == right_tokens:
+        return True
+
+    left_symbols = {token for token in left_tokens if token.isdigit() or token in {"+", "-", "*", "/"}}
+    right_symbols = {token for token in right_tokens if token.isdigit() or token in {"+", "-", "*", "/"}}
+    if left_symbols != right_symbols:
+        return False
+
+    left_text = " ".join(left_tokens)
+    right_text = " ".join(right_tokens)
+    if SequenceMatcher(None, left_text, right_text).ratio() >= 0.88:
+        return True
+
+    left_set = set(left_tokens)
+    right_set = set(right_tokens)
+    common = len(left_set & right_set)
+    return common >= 2 and common / max(len(left_set), len(right_set)) >= 0.85
+
+
+def normalize_transcript_tokens(text: str) -> list[str]:
+    tokens = re.findall(r"[a-zа-яё0-9]+|[+\-*/]", text.casefold().replace("ё", "е"))
+    return [_SPOKEN_TOKEN_EQUIVALENTS.get(token, token) for token in tokens]
 
 
 def select_recent_lines(lines: list[str], max_chars: int) -> str:

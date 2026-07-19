@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from collections.abc import Callable
 from typing import Any
 
 from .answer_provider import AnswerProviderGateway
@@ -27,8 +28,11 @@ from .session_types import (
 )
 
 
+SessionEventSink = Callable[[str, dict[str, Any]], None]
+
+
 class SessionManager(SessionAnswerFlow):
-    def __init__(self) -> None:
+    def __init__(self, event_sink: SessionEventSink | None = None) -> None:
         self._condition = threading.Condition()
         self._events: list[SessionEvent] = []
         self._sequence = 0
@@ -42,6 +46,7 @@ class SessionManager(SessionAnswerFlow):
         self._last_candidate_key = ""
         self._last_candidate_at = 0.0
         self._candidate_sequence = 0
+        self._pending_candidate_timer: threading.Timer | None = None
         self._metric_store = SessionMetrics(trace_live_event)
         self._active_question_id = ""
         self._cancelled_streams = 0
@@ -49,6 +54,9 @@ class SessionManager(SessionAnswerFlow):
         self._answer_provider_override: str | None = None
         self._current_question: dict[str, Any] | None = None
         self._current_answer_text = ""
+        self._event_sinks: list[SessionEventSink] = []
+        if event_sink is not None:
+            self._event_sinks.append(event_sink)
         self._summary = DialogueSummaryCoordinator(
             self._stream_answer,
             self.prompt_config,
@@ -61,6 +69,10 @@ class SessionManager(SessionAnswerFlow):
         with self._condition:
             if self._state in {"listening", "answering"}:
                 return self.snapshot_locked()
+            pending = self._pending_candidate_timer
+            self._pending_candidate_timer = None
+            if pending is not None:
+                pending.cancel()
             self._generation += 1
             self._session_id = new_id("session")
             self._memory = DialogueMemory()
@@ -82,6 +94,7 @@ class SessionManager(SessionAnswerFlow):
 
     def stop(self) -> dict[str, Any]:
         self._cancel_answer.set()
+        self._cancel_pending_remote_utterance()
         with self._condition:
             self._generation += 1
             self._summary.reset(self._generation, self._session_id)
@@ -93,6 +106,7 @@ class SessionManager(SessionAnswerFlow):
 
     def pause(self) -> dict[str, Any]:
         self._cancel_answer.set()
+        self._cancel_pending_remote_utterance()
         with self._condition:
             if self._state not in {"listening", "answering", "degraded"}:
                 return self.snapshot_locked()
@@ -137,6 +151,36 @@ class SessionManager(SessionAnswerFlow):
             if self._state == "idle":
                 self._state = "listening"
                 self.publish_locked("session_state", self.snapshot_locked())
+            duplicate = self._memory.find_cross_source_duplicate(turn) if turn.is_final else None
+            if duplicate is not None and turn.source == MIC_SOURCE:
+                removed = self._memory.remove_latest_matching_turn(
+                    MIC_SOURCE,
+                    turn.text,
+                    timestamp_ms=turn.timestamp_ms,
+                )
+                if removed is not None:
+                    self._publish_transcript_removal_locked(removed, duplicate.turn_id)
+                trace_live_event(
+                    "session.transcript_skipped",
+                    source=turn.source,
+                    text=turn.text,
+                    reason="cross_source_duplicate",
+                    duplicateOf=duplicate.turn_id,
+                )
+                return {
+                    "sessionId": self._session_id,
+                    "source": turn.source,
+                    "text": turn.text,
+                    "isFinal": turn.is_final,
+                    "timestampMs": turn.timestamp_ms,
+                    "skipped": True,
+                    "reason": "cross_source_duplicate",
+                    "duplicateOf": duplicate.turn_id,
+                }
+            if duplicate is not None and duplicate.source == MIC_SOURCE:
+                removed = self._memory.remove_turn(duplicate.turn_id)
+                if removed is not None:
+                    self._publish_transcript_removal_locked(removed, turn.turn_id)
             update = self._memory.append(turn, refine_latest=is_refinement)
             if update is None:
                 return {
@@ -179,11 +223,33 @@ class SessionManager(SessionAnswerFlow):
                 *self._memory.summary_source(),
             ) if turn.is_final else None
 
-        if detect_question and turn.source == REMOTE_SOURCE and turn.is_final and not is_refinement:
-            self._consider_remote_utterance(turn.text, turn.timestamp_ms)
+        if detect_question and turn.source == REMOTE_SOURCE and turn.is_final:
+            self._schedule_remote_utterance(turn.text, turn.timestamp_ms)
         if summary_source is not None:
             self._summary.observe(*summary_source)
         return payload
+
+    def _publish_transcript_removal_locked(self, turn: DialogueTurn, duplicate_of: str) -> None:
+        payload = {
+            "sessionId": self._session_id,
+            "turnId": turn.turn_id,
+            "source": turn.source,
+            "text": "",
+            "isFinal": turn.is_final,
+            "timestampMs": turn.timestamp_ms,
+            "operation": "remove",
+            "memoryWindowMs": self._memory.retention_ms,
+            "duplicateOf": duplicate_of,
+        }
+        self.publish_locked("transcript", payload)
+        trace_live_event(
+            "session.transcript_removed",
+            source=turn.source,
+            text=turn.text,
+            turnId=turn.turn_id,
+            reason="cross_source_duplicate",
+            duplicateOf=duplicate_of,
+        )
 
     def publish_status(self, event: str, payload: dict[str, Any]) -> None:
         self._publish(event, payload)
@@ -297,11 +363,27 @@ class SessionManager(SessionAnswerFlow):
             return self._memory.realtime_context(max_turns=max_turns, max_chars=max_chars)
 
     def realtime_instructions(self, base: str) -> str:
-        return build_realtime_session_instructions(base, self.prompt_config())
+        config = self.prompt_config()
+        with self._condition:
+            dialogue_context = self._memory.realtime_context(max_turns=16, max_chars=3600)
+        return build_realtime_session_instructions(
+            base,
+            config,
+            relevance_text=dialogue_context,
+        )
 
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             return self.snapshot_locked()
+
+    def is_processing(self) -> bool:
+        with self._condition:
+            answer_running = self._answer_thread is not None and self._answer_thread.is_alive()
+            candidate_pending = (
+                self._pending_candidate_timer is not None
+                and self._pending_candidate_timer.is_alive()
+            )
+            return self._state == "answering" or answer_running or candidate_pending
 
     def listen(self, after: int = 0) -> Iterator[SessionEvent]:
         cursor = after
@@ -319,6 +401,15 @@ class SessionManager(SessionAnswerFlow):
                     self._condition.notify_all()
                 cursor = event.sequence
             yield event
+
+    def add_event_sink(self, sink: SessionEventSink) -> None:
+        with self._condition:
+            if sink not in self._event_sinks:
+                self._event_sinks.append(sink)
+
+    def remove_event_sink(self, sink: SessionEventSink) -> None:
+        with self._condition:
+            self._event_sinks = [item for item in self._event_sinks if item is not sink]
 
     def _stream_answer(self, messages: list[ChatMessage]) -> Iterator[AnswerStreamChunk | str]:
         with self._condition:
@@ -457,6 +548,11 @@ class SessionManager(SessionAnswerFlow):
         self._events.append(item)
         self._events = self._events[-300:]
         self._condition.notify_all()
+        for sink in tuple(self._event_sinks):
+            try:
+                sink(event, payload)
+            except Exception:
+                continue
 
     def next_event_locked(self, after: int) -> SessionEvent | None:
         for event in self._events:

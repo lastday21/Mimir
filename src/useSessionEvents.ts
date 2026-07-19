@@ -15,9 +15,9 @@ export function useSessionEvents() {
   const [currentQuestion, setCurrentQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [audioLevels, setAudioLevels] = useState<Record<AudioSource, AudioLevel>>(emptyAudioLevels());
-  const [audioMode, setAudioMode] = useState<AudioMode>("yandex_realtime");
+  const [audioMode, setAudioMode] = useState<AudioMode>("speechkit");
   const [audioRunning, setAudioRunning] = useState(false);
-  const [status, setStatus] = useState("Запустите сервер Mimir");
+  const [status, setStatus] = useState("Подключение к Mimir");
   const activeQuestionId = useRef("");
 
   const applySessionSnapshot = useCallback((snapshot: SessionSnapshot) => {
@@ -25,12 +25,13 @@ export function useSessionEvents() {
     setTurns(snapshot.memory.turns);
     const question = snapshot.currentQuestion;
     activeQuestionId.current = question?.questionId ?? "";
-    setCurrentQuestion(question?.question ?? "");
-    setAnswer(
-      question && snapshot.currentAnswer.questionId === question.questionId
-        ? snapshot.currentAnswer.text
-        : ""
-    );
+    setCurrentQuestion((current) => question?.question ?? (snapshot.state === "degraded" ? current : ""));
+    setAnswer((current) => {
+      if (question && snapshot.currentAnswer.questionId === question.questionId) {
+        return snapshot.currentAnswer.text;
+      }
+      return snapshot.state === "degraded" ? current : "";
+    });
   }, []);
 
   useEffect(() => {
@@ -43,7 +44,9 @@ export function useSessionEvents() {
     events.addEventListener("session_state", (event) => {
       const payload = parseEvent<SessionSnapshot>(event);
       applySessionSnapshot(payload);
-      const lastError = typeof payload.metrics.lastError === "string" ? payload.metrics.lastError : "";
+      const lastError = typeof payload.metrics.lastError === "string"
+        ? runtimeErrorMessage(payload.metrics.lastError)
+        : "";
       setStatus(payload.state === "degraded" ? lastError || "Сессия работает с ограничениями" : `Сессия: ${payload.state}`);
     });
 
@@ -79,9 +82,20 @@ export function useSessionEvents() {
     });
 
     events.addEventListener("answer_error", (event) => {
-      const payload = parseEvent<{ questionId: string; error: string }>(event);
-      if (payload.questionId !== activeQuestionId.current) return;
-      setStatus(payload.error);
+      const payload = parseEvent<{ questionId: string; question?: string; error: string }>(event);
+      if (payload.questionId && payload.questionId !== activeQuestionId.current) return;
+      const message = runtimeErrorMessage(payload.error);
+      if (payload.question) {
+        activeQuestionId.current = "";
+        setCurrentQuestion(payload.question);
+      }
+      setAnswer(`Ответ не получен. ${message}`);
+      setStatus(message);
+    });
+
+    events.addEventListener("transcript_uncertain", (event) => {
+      const payload = parseEvent<{ message: string }>(event);
+      setStatus(payload.message);
     });
 
     events.addEventListener("stt_status", (event) => {
@@ -91,7 +105,7 @@ export function useSessionEvents() {
 
     events.addEventListener("stt_error", (event) => {
       const payload = parseEvent<{ error: string }>(event);
-      setStatus(payload.error);
+      setStatus(runtimeErrorMessage(payload.error));
     });
 
     events.addEventListener("audio_status", (event) => {
@@ -105,7 +119,8 @@ export function useSessionEvents() {
           setAudioLevels(emptyAudioLevels());
         }
       }
-      setStatus(payload.source ? `Звук ${payload.source}: ${payload.status}` : `Звук: ${payload.status}`);
+      const state = audioStatusLabel(payload.status);
+      setStatus(payload.source ? `${audioSourceLabel(payload.source)}: ${state}` : `Звук: ${state}`);
     });
 
     events.addEventListener("audio_level", (event) => {
@@ -129,15 +144,15 @@ export function useSessionEvents() {
           setAudioLevels(emptyAudioLevels());
         }
       }
-      setStatus(payload.error);
+      setStatus(runtimeErrorMessage(payload.error));
     });
 
     events.onerror = () => {
-      setStatus("Нет связи с сервером событий");
+      setStatus("Нет связи с Mimir");
     };
 
     events.onopen = () => {
-      setStatus((current) => current === "Нет связи с сервером событий" ? "Сервер событий подключен" : current);
+      setStatus((current) => current === "Нет связи с Mimir" ? "Mimir подключен" : current);
     };
 
     return () => events.close();
@@ -165,6 +180,9 @@ function parseEvent<T>(event: Event): T {
 }
 
 function mergeTranscriptTurn(current: TranscriptTurn[], update: TranscriptTurn): TranscriptTurn[] {
+  if (update.operation === "remove") {
+    return current.filter((turn) => turn.turnId !== update.turnId);
+  }
   const next = [...current];
   const index = next.findIndex((turn) => turn.turnId === update.turnId);
   if (index >= 0) {
@@ -193,4 +211,42 @@ function isAudioSource(source: string): source is AudioSource {
 
 export function isAudioMode(mode: string): mode is AudioMode {
   return mode === "yandex_realtime" || mode === "speechkit" || mode === "local_vosk";
+}
+
+function audioSourceLabel(source: string): string {
+  if (source === "remote") return "Собеседник";
+  if (source === "mic") return "Вы";
+  return "Звук";
+}
+
+function audioStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    starting: "подключение",
+    streaming: "звук поступает",
+    speech: "идёт речь",
+    silence: "пауза",
+    fallback: "включён запасной способ распознавания",
+    stopping: "остановка",
+    stopped: "остановлено",
+    done: "завершено",
+    idle: "ожидание"
+  };
+  return labels[status] ?? status;
+}
+
+function runtimeErrorMessage(error: string): string {
+  const normalized = error.toLowerCase();
+  if (normalized.includes("localhost:11434") || normalized.includes("ollama")) {
+    return "Локальная нейросеть не запущена.";
+  }
+  if (
+    normalized.includes("speechkit") &&
+    (normalized.includes("failed to connect") || normalized.includes("handshaker shutdown"))
+  ) {
+    return "Не удалось подключиться к распознаванию речи.";
+  }
+  if (normalized.includes("yandex ai studio failed")) {
+    return "Не удалось получить ответ от Яндекса.";
+  }
+  return error;
 }

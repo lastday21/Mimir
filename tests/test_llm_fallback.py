@@ -30,6 +30,29 @@ class LlmFallbackTests(unittest.TestCase):
         self.assertEqual(answer_error.payload["error"], "request timed out")
         self.assertEqual(manager.snapshot()["metrics"]["errorPhase"], "answer")
 
+    def test_decision_error_is_published_before_question_is_created(self) -> None:
+        class FailingSessionManager(SessionManager):
+            def _stream_answer(self, _messages: list[ChatMessage]):
+                raise TimeoutError("request timed out")
+
+        manager = FailingSessionManager()
+        manager.start()
+        manager.ingest_transcript("remote", "Сколько будет пять плюс пять?")
+        self.wait_for_error(manager)
+
+        events = manager.listen(after=0)
+        answer_error = None
+        for _ in range(12):
+            event = next(events)
+            if event.event == "answer_error":
+                answer_error = event
+                break
+
+        self.assertIsNotNone(answer_error)
+        self.assertEqual(answer_error.payload["questionId"], "")
+        self.assertEqual(answer_error.payload["question"], "Сколько будет пять плюс пять?")
+        self.assertEqual(answer_error.payload["error"], "request timed out")
+
     def test_yandex_failure_falls_back_to_preferred_ollama_model(self) -> None:
         original_load_config = session_module.load_config
         original_read_secret = session_module.read_secret

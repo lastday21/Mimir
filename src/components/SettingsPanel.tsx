@@ -1,16 +1,18 @@
 import { useState } from "react";
 import { Check, Cloud, Server } from "lucide-react";
-import { AppConfig, AudioMode, ModelInfo, Provider } from "../api";
+import { AppConfig, AudioApplication, AudioMode, ModelInfo, Provider } from "../api";
 import { ConversationSettingsFields } from "./ConversationSettingsFields";
 import { ModelSettingsFields } from "./ModelSettingsFields";
+import { TestingSettingsFields } from "./TestingSettingsFields";
 import { UserProfileFields } from "./UserProfileFields";
 
-type SettingsSection = "conversation" | "profile" | "model";
+type SettingsSection = "conversation" | "profile" | "model" | "testing";
 
 interface SettingsPanelProps {
   apiKey: string;
   busy: boolean;
   config: AppConfig;
+  audioApplications: AudioApplication[];
   models: ModelInfo[];
   setupProblem: string | null;
   setupReady: boolean;
@@ -18,6 +20,7 @@ interface SettingsPanelProps {
   onAudioModeChange: (mode: AudioMode) => void;
   onConfigChange: (config: AppConfig) => void;
   onLoadModels: () => void;
+  onLoadAudioApplications: () => void;
   onProviderChange: (provider: Provider) => void;
   onSave: (closeAfterSave: boolean) => void;
 }
@@ -26,6 +29,7 @@ export function SettingsPanel({
   apiKey,
   busy,
   config,
+  audioApplications,
   models,
   setupProblem,
   setupReady,
@@ -33,6 +37,7 @@ export function SettingsPanel({
   onAudioModeChange,
   onConfigChange,
   onLoadModels,
+  onLoadAudioApplications,
   onProviderChange,
   onSave
 }: SettingsPanelProps) {
@@ -64,6 +69,12 @@ export function SettingsPanel({
         >
           Модель и звук
         </button>
+        <button
+          className={activeSection === "testing" ? "active" : ""}
+          onClick={() => setActiveSection("testing")}
+        >
+          Тестирование
+        </button>
       </nav>
 
       {activeSection === "conversation" && (
@@ -85,12 +96,22 @@ export function SettingsPanel({
           apiKey={apiKey}
           busy={busy}
           config={config}
+          audioApplications={audioApplications}
           models={models}
           onApiKeyChange={onApiKeyChange}
           onAudioModeChange={onAudioModeChange}
           onConfigChange={onConfigChange}
           onLoadModels={onLoadModels}
+          onLoadAudioApplications={onLoadAudioApplications}
           onProviderChange={onProviderChange}
+        />
+      )}
+
+      {activeSection === "testing" && (
+        <TestingSettingsFields
+          busy={busy}
+          config={config}
+          onConfigChange={onConfigChange}
         />
       )}
 

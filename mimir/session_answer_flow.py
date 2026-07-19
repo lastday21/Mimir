@@ -18,6 +18,42 @@ from .session_types import (
 
 
 class SessionAnswerFlow:
+    REMOTE_UTTERANCE_SETTLE_SECONDS = 0.3
+
+    def _schedule_remote_utterance(self, text: str, timestamp_ms: int) -> None:
+        with self._condition:
+            generation = self._generation
+            pending = self._pending_candidate_timer
+            if pending is not None:
+                pending.cancel()
+            timer = threading.Timer(
+                self.REMOTE_UTTERANCE_SETTLE_SECONDS,
+                self._run_scheduled_remote_utterance,
+                args=(text, timestamp_ms, generation),
+            )
+            timer.daemon = True
+            self._pending_candidate_timer = timer
+            timer.start()
+
+    def _run_scheduled_remote_utterance(
+        self,
+        text: str,
+        timestamp_ms: int,
+        generation: int,
+    ) -> None:
+        with self._condition:
+            if generation != self._generation or self._state in {"paused", "stopped"}:
+                return
+            self._pending_candidate_timer = None
+        self._consider_remote_utterance(text, timestamp_ms)
+
+    def _cancel_pending_remote_utterance(self) -> None:
+        with self._condition:
+            pending = self._pending_candidate_timer
+            self._pending_candidate_timer = None
+        if pending is not None:
+            pending.cancel()
+
     def _consider_remote_utterance(self, text: str, timestamp_ms: int) -> None:
         key = normalize_question_key(text)
         now = time.monotonic()
@@ -97,6 +133,9 @@ class SessionAnswerFlow:
                     if decision.action == "skip":
                         self._record_skipped_utterance(generation, candidate_sequence, utterance)
                         return
+                    if decision.action == "unclear":
+                        self._record_unclear_utterance(generation, candidate_sequence, utterance)
+                        return
                     question_id = self._activate_model_question(
                         utterance,
                         timestamp_ms,
@@ -138,6 +177,9 @@ class SessionAnswerFlow:
                 if decision is None or decision.action == "skip":
                     self._record_skipped_utterance(generation, candidate_sequence, utterance)
                     return
+                if decision.action == "unclear":
+                    self._record_unclear_utterance(generation, candidate_sequence, utterance)
+                    return
                 question_id = self._activate_model_question(
                     utterance,
                     timestamp_ms,
@@ -175,8 +217,13 @@ class SessionAnswerFlow:
         except Exception as error:
             message = str(error) or error.__class__.__name__
             trace_live_event("answer.error", questionId=question_id, error=message)
-            if question_id:
-                self._publish_if_current(generation, "answer_error", {"questionId": question_id, "error": message})
+            error_payload = {
+                "questionId": question_id,
+                "error": message,
+            }
+            if not question_id:
+                error_payload["question"] = utterance
+            self._publish_if_current(generation, "answer_error", error_payload)
             with self._condition:
                 if generation == self._generation:
                     self._state = "degraded"
@@ -315,6 +362,22 @@ class SessionAnswerFlow:
                 return
             self._metric_store.increment("skippedUtterances")
         trace_live_event("session.utterance_skipped", reason="model", text=text)
+
+    def _record_unclear_utterance(self, generation: int, candidate_sequence: int, text: str) -> None:
+        message = "Не уверен, что правильно расслышал вопрос. Лучше переспросить."
+        with self._condition:
+            if generation != self._generation or candidate_sequence != self._candidate_sequence:
+                return
+            self._metric_store.increment("unclearUtterances")
+            self.publish_locked(
+                "transcript_uncertain",
+                {
+                    "sessionId": self._session_id,
+                    "heardText": text,
+                    "message": message,
+                },
+            )
+        trace_live_event("session.utterance_uncertain", text=text)
 
     def trigger_question(
         self,

@@ -98,6 +98,8 @@ class RealtimeAudioConfig:
     vad_enabled: bool = True
     vad: EnergyVadConfig = field(default_factory=EnergyVadConfig)
     device_ids: dict[str, str] = field(default_factory=dict)
+    application_process_id: int = 0
+    record_testing: bool = False
 
 
 RealtimeFallbackStarter = Callable[[RealtimeAudioConfig, str], object]
@@ -125,6 +127,8 @@ class RealtimeAudioController:
         self._config: RealtimeAudioConfig | None = None
         self._last_error = ""
         self._last_dialogue_context = ""
+        self._last_realtime_instructions = ""
+        self._settings_revision = 0
         self._fallback_started = False
 
     def start(self, config: RealtimeAudioConfig, api_key: str, folder_id: str) -> dict[str, object]:
@@ -156,11 +160,14 @@ class RealtimeAudioController:
                 vad_enabled=config.vad_enabled,
                 vad=config.vad,
                 device_ids=dict(config.device_ids),
+                application_process_id=config.application_process_id,
+                record_testing=config.record_testing,
             )
             self._active_sources = set(sources)
             self._running = True
             self._last_error = ""
             self._last_dialogue_context = ""
+            self._last_realtime_instructions = ""
             self._fallback_started = False
             stop_event = self._stop_event
 
@@ -174,6 +181,8 @@ class RealtimeAudioController:
             chunkDurationMs=self._config.chunk_duration_ms,
             vadEnabled=self._config.vad_enabled,
             deviceIds=self._config.device_ids,
+            applicationProcessId=self._config.application_process_id,
+            recordTesting=self._config.record_testing,
         )
         self.publish(
             "audio_status",
@@ -192,6 +201,17 @@ class RealtimeAudioController:
         )
         self._thread.start()
         return self.snapshot()
+
+    def refresh_settings(self) -> None:
+        with self._lock:
+            self._settings_revision += 1
+            revision = self._settings_revision
+            running = self._running
+        trace_live_event(
+            "realtime.settings.refresh",
+            revision=revision,
+            running=running,
+        )
 
     def stop(self) -> dict[str, object]:
         with self._lock:
@@ -234,6 +254,8 @@ class RealtimeAudioController:
             "chunkDurationMs": config.chunk_duration_ms if config else 200,
             "vadEnabled": config.vad_enabled if config else True,
             "deviceIds": dict(config.device_ids) if config else {},
+            "applicationProcessId": config.application_process_id if config else 0,
+            "recordTesting": config.record_testing if config else False,
             "tracePath": trace_path_payload(),
             "lastError": self._last_error,
         }
@@ -314,16 +336,26 @@ class RealtimeAudioController:
         stop_event: threading.Event,
     ) -> None:
         async with self.realtime_factory(realtime_config) as client:
+            settings_revision = self._current_settings_revision()
             instructions = self._latest_realtime_instructions()
             await client.setup_session(instructions, config.sample_rate_hertz)
             with self._lock:
                 self._last_dialogue_context = ""
+                self._last_realtime_instructions = instructions
             self._enqueue_dialogue_context_now(queue, "session")
             self.publish(
                 "audio_status",
                 {"source": REMOTE_SOURCE, "mode": "yandex_realtime", "status": "connected", "running": True},
             )
-            sender = asyncio.create_task(self._send_events(client, queue, stop_event), name="mimir-realtime-send")
+            sender = asyncio.create_task(
+                self._send_events(
+                    client,
+                    queue,
+                    stop_event,
+                    settings_revision,
+                ),
+                name="mimir-realtime-send",
+            )
             receiver = asyncio.create_task(self._receive_events(client, queue, stop_event), name="mimir-realtime-receive")
             try:
                 drained_at: float | None = None
@@ -426,6 +458,7 @@ class RealtimeAudioController:
                 )
                 if event.is_final and event.text.strip():
                     self._enqueue_dialogue_context(loop, queue, MIC_SOURCE)
+                    self._enqueue_realtime_instructions(loop, queue, MIC_SOURCE)
         except Exception as error:
             self._publish_error(MIC_SOURCE, str(error), running=bool(self.snapshot()["running"]), phase="mic_producer")
         finally:
@@ -436,6 +469,7 @@ class RealtimeAudioController:
         client: RealtimeClientProtocol,
         queue: asyncio.Queue[RealtimeQueueItem],
         stop_event: threading.Event,
+        applied_settings_revision: int,
     ) -> None:
         last_context_refresh = time.monotonic()
         while not stop_event.is_set():
@@ -449,6 +483,24 @@ class RealtimeAudioController:
             elif kind == "dialogue_context" and isinstance(payload, str):
                 trace_live_event("realtime.dialogue_context.send", source=_source, chars=len(payload))
                 await client.add_dialogue_context(payload)
+            elif kind == "session_instructions" and isinstance(payload, str):
+                if self._is_current_realtime_instructions(payload):
+                    trace_live_event("realtime.session_instructions.send", source=_source, chars=len(payload))
+                    await client.update_instructions(payload)
+                else:
+                    trace_live_event("realtime.session_instructions.skip_stale", source=_source)
+
+            settings_revision = self._current_settings_revision()
+            if settings_revision != applied_settings_revision:
+                instructions = self._take_realtime_instructions_update()
+                if instructions:
+                    trace_live_event(
+                        "realtime.session_instructions.send",
+                        source="settings",
+                        chars=len(instructions),
+                    )
+                    await client.update_instructions(instructions)
+                applied_settings_revision = settings_revision
 
             now = time.monotonic()
             if now - last_context_refresh >= REALTIME_CONTEXT_REFRESH_SECONDS:
@@ -478,6 +530,7 @@ class RealtimeAudioController:
                     self.record_stt_result(REMOTE_SOURCE, True)
                     self.session.ingest_transcript(REMOTE_SOURCE, text, is_final=True, detect_question=False)
                     self._enqueue_dialogue_context_now(queue, REMOTE_SOURCE)
+                    self._enqueue_realtime_instructions_now(queue, REMOTE_SOURCE)
             elif event_type == "conversation.item.input_audio_transcription.delta":
                 delta = str(message.get("delta") or "").strip()
                 if delta:
@@ -540,6 +593,7 @@ class RealtimeAudioController:
             sample_rate_hertz=config.sample_rate_hertz,
             chunk_duration_ms=config.chunk_duration_ms,
             device_id=config.device_ids.get(source),
+            process_id=config.application_process_id if source == REMOTE_SOURCE else None,
         )
         return self.source_factory(source, capture_config)
 
@@ -569,6 +623,8 @@ class RealtimeAudioController:
                         "source": source,
                         "rms": decision.rms,
                         "speech": decision.is_speech,
+                        "speechThreshold": decision.speech_threshold,
+                        "silenceThreshold": decision.silence_threshold,
                     },
                 )
                 last_level_at = now
@@ -577,9 +633,9 @@ class RealtimeAudioController:
                 self.record_audio_speech_started(source)
             if decision.speech_ended:
                 self.publish("audio_status", {"source": source, "mode": "yandex_realtime", "status": "silence"})
-            if decision.send_to_stt:
-                self.record_audio_chunk(source, len(chunk))
-                yield chunk
+            for stt_chunk in decision.audio_chunks:
+                self.record_audio_chunk(source, len(stt_chunk))
+                yield stt_chunk
 
     def _finish_source(self, source: str) -> None:
         with self._lock:
@@ -625,6 +681,45 @@ class RealtimeAudioController:
         if not callable(builder):
             return REALTIME_INSTRUCTIONS
         return str(builder(REALTIME_INSTRUCTIONS)).strip() or REALTIME_INSTRUCTIONS
+
+    def _enqueue_realtime_instructions(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue[RealtimeQueueItem],
+        source: str,
+    ) -> None:
+        instructions = self._take_realtime_instructions_update()
+        if not instructions:
+            return
+        trace_live_event("audio.session_instructions.enqueue", source=source, chars=len(instructions))
+        self._put(loop, queue, ("session_instructions", source, instructions))
+
+    def _enqueue_realtime_instructions_now(
+        self,
+        queue: asyncio.Queue[RealtimeQueueItem],
+        source: str,
+    ) -> None:
+        instructions = self._take_realtime_instructions_update()
+        if not instructions:
+            return
+        trace_live_event("audio.session_instructions.enqueue", source=source, chars=len(instructions))
+        self._put_nowait(queue, ("session_instructions", source, instructions))
+
+    def _take_realtime_instructions_update(self) -> str:
+        instructions = self._latest_realtime_instructions()
+        with self._lock:
+            if instructions == self._last_realtime_instructions:
+                return ""
+            self._last_realtime_instructions = instructions
+        return instructions
+
+    def _current_settings_revision(self) -> int:
+        with self._lock:
+            return self._settings_revision
+
+    def _is_current_realtime_instructions(self, instructions: str) -> bool:
+        with self._lock:
+            return instructions == self._last_realtime_instructions
 
     def _put(
         self,

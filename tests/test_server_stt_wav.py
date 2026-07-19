@@ -210,6 +210,7 @@ class ServerSpeechKitWavTests(unittest.TestCase):
 
             self.assertEqual(payload["mode"], "local_vosk")
             self.assertEqual(starts, ["speechkit", "local_vosk"])
+            self.assertIsNone(server.SESSION_MANAGER.metrics()["answerProviderOverride"])
         finally:
             server.LIVE_AUDIO = original_live_audio
             server.REALTIME_AUDIO = original_realtime_audio
@@ -239,6 +240,33 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             httpd.server_close()
             thread.join(timeout=5)
             server.list_audio_devices = original_list_audio_devices
+
+    def test_audio_applications_endpoint_returns_manual_choices(self) -> None:
+        original_list_audio_applications = server.list_audio_applications
+        server.list_audio_applications = lambda: [
+            {"processId": 42, "executable": "meeting.exe", "title": "Рабочий созвон"},
+            {"processId": 73, "executable": "browser.exe", "title": "Встреча в браузере"},
+        ]
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            conn = HTTPConnection(host, port, timeout=5)
+            conn.request("GET", "/api/audio/applications")
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            conn.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertTrue(payload["available"])
+            self.assertEqual([item["processId"] for item in payload["applications"]], [42, 73])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.list_audio_applications = original_list_audio_applications
 
     def test_starts_wav_stt_job(self) -> None:
         original_job = server.run_wav_stt_job
@@ -572,7 +600,7 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(payload["mode"], "local_vosk")
             self.assertEqual(local_calls, [(("remote",), "")])
-            self.assertEqual(server.SESSION_MANAGER.metrics()["answerProviderOverride"], "ollama")
+            self.assertIsNone(server.SESSION_MANAGER.metrics()["answerProviderOverride"])
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -646,6 +674,7 @@ class ServerSpeechKitWavTests(unittest.TestCase):
         original_read_secret = server.read_secret
         original_load_config = server.load_config
         original_list_audio_devices = server.list_audio_devices
+        original_list_audio_applications = server.list_audio_applications
 
         class FakeAudio:
             def snapshot(self) -> dict[str, object]:
@@ -662,6 +691,9 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             {"id": "remote1", "source": "remote"},
             {"id": "mic1", "source": "mic"},
         ]
+        server.list_audio_applications = lambda: [
+            {"processId": 42, "executable": "meeting.exe", "title": "Рабочий созвон"},
+        ]
         httpd = server.create_server(port=0)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -672,7 +704,8 @@ class ServerSpeechKitWavTests(unittest.TestCase):
                 {
                     "sources": ["remote", "mic"],
                     "mode": "yandex_realtime",
-                    "deviceIds": {"remote": "remote1", "mic": "mic1"},
+                    "deviceIds": {"mic": "mic1"},
+                    "applicationProcessId": 42,
                 }
             ).encode("utf-8")
             conn = HTTPConnection(host, port, timeout=5)
@@ -701,6 +734,7 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             server.read_secret = original_read_secret
             server.load_config = original_load_config
             server.list_audio_devices = original_list_audio_devices
+            server.list_audio_applications = original_list_audio_applications
 
 
 if __name__ == "__main__":

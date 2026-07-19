@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Bot, Check, Loader2, MessageSquare, Pause, Play, Settings } from "lucide-react";
 import {
   AppConfig,
+  AudioApplication,
   AudioMode,
   AudioDevice,
   ModelInfo,
   Provider,
   getConfig,
+  listAudioApplications,
   listAudioDevices,
   listModels,
   pauseSession,
@@ -28,7 +30,12 @@ const DEFAULT_CONFIG: AppConfig = {
   yandexFolderId: "",
   llmProvider: "yandex_ai_studio",
   llmModel: "yandexgpt/latest",
-  audioMode: "yandex_realtime",
+  audioMode: "speechkit",
+  audioApplication: {
+    processId: 0,
+    executable: "",
+    title: ""
+  },
   ollamaBaseUrl: "http://localhost:11434",
   hasYandexKey: false,
   profile: {
@@ -42,6 +49,9 @@ const DEFAULT_CONFIG: AppConfig = {
     mode: "interview",
     goal: "",
     context: ""
+  },
+  testing: {
+    enabled: false
   },
   setupCompleted: false,
   hotkeys: {
@@ -70,9 +80,11 @@ export function App() {
   const [modelsByProvider, setModelsByProvider] = useState<Record<Provider, ModelInfo[]>>(DEFAULT_MODELS);
   const [setupOpen, setSetupOpen] = useState(!IS_OVERLAY);
   const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
+  const [audioApplications, setAudioApplications] = useState<AudioApplication[]>([]);
   const [liveRemote, setLiveRemote] = useState(true);
   const [liveMic, setLiveMic] = useState(true);
   const [busy, setBusy] = useState(false);
+  const messengerRef = useRef<HTMLDivElement>(null);
   const {
     answer,
     applySessionSnapshot,
@@ -90,8 +102,27 @@ export function App() {
   } = useSessionEvents();
 
   useEffect(() => {
+    const messenger = messengerRef.current;
+    if (messenger) {
+      messenger.scrollTop = messenger.scrollHeight;
+    }
+  }, [turns]);
+
+  useEffect(() => {
     document.body.classList.toggle("overlay-body", IS_OVERLAY);
     return () => document.body.classList.remove("overlay-body");
+  }, []);
+
+  useEffect(() => {
+    if (IS_OVERLAY) return;
+    listAudioApplications()
+      .then((payload) => {
+        setAudioApplications(payload.available ? payload.applications : []);
+        if (!payload.available && payload.error) {
+          setStatus(payload.error);
+        }
+      })
+      .catch((error) => setStatus(error.message));
   }, []);
 
   useEffect(() => {
@@ -144,7 +175,7 @@ export function App() {
     const nextMode: AudioMode = provider === "ollama"
       ? "local_vosk"
       : config.audioMode === "local_vosk"
-        ? "yandex_realtime"
+        ? "speechkit"
         : config.audioMode;
     setConfig({
       ...config,
@@ -214,6 +245,28 @@ export function App() {
     }
   }
 
+  async function handleLoadAudioApplications() {
+    setBusy(true);
+    try {
+      const payload = await listAudioApplications();
+      setAudioApplications(payload.available ? payload.applications : []);
+      if (!payload.available) {
+        setStatus(payload.error || "Не удалось получить список приложений");
+        return;
+      }
+      setStatus(`Приложений найдено: ${payload.applications.length}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Не удалось получить список приложений");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleOpenSettings() {
+    setSetupOpen(true);
+    void handleLoadAudioApplications();
+  }
+
   async function handlePauseSession() {
     setBusy(true);
     try {
@@ -237,18 +290,32 @@ export function App() {
     setBusy(true);
     try {
       setAudioLevels(emptyAudioLevels());
-      const deviceIds = recommendedDeviceIds(audioDevices, sources);
-      const preflight = await preflightLiveAudio(sources, deviceIds, config.audioMode);
+      const deviceIds = recommendedDeviceIds(audioDevices, sources.filter((source) => source === "mic"));
+      const applicationProcessId = config.audioApplication.processId;
+      const preflight = await preflightLiveAudio(
+        sources,
+        deviceIds,
+        config.audioMode,
+        applicationProcessId
+      );
       if (!preflight.ok) {
         setStatus(preflight.errors[0] || "Проверка звука не прошла");
         return;
       }
-      const snapshot = await startLiveAudio(sources, deviceIds, config.audioMode);
+      const snapshot = await startLiveAudio(
+        sources,
+        deviceIds,
+        config.audioMode,
+        applicationProcessId
+      );
       if (snapshot.mode && isAudioMode(snapshot.mode)) {
         setAudioMode(snapshot.mode);
       }
       setAudioRunning(snapshot.running);
-      setStatus(`Звук слушается: ${(snapshot.mode ?? config.audioMode).replace("_", " ")} ${snapshot.sources.join(" + ")}`);
+      const runningMode = snapshot.mode && isAudioMode(snapshot.mode) ? snapshot.mode : config.audioMode;
+      setStatus(
+        `Звук включён: ${audioModeLabel(runningMode)} · ${snapshot.sources.map(audioSourceLabel).join(" + ")}`
+      );
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Не удалось запустить звук");
     } finally {
@@ -269,6 +336,7 @@ export function App() {
       apiKey={apiKey}
       busy={busy}
       config={config}
+      audioApplications={audioApplications}
       models={providerModels}
       setupProblem={setupProblem}
       setupReady={setupReady}
@@ -276,6 +344,7 @@ export function App() {
       onAudioModeChange={handleAudioModeChange}
       onConfigChange={setConfig}
       onLoadModels={handleLoadModels}
+      onLoadAudioApplications={handleLoadAudioApplications}
       onProviderChange={handleProviderChange}
       onSave={handleSaveSetup}
     />
@@ -315,8 +384,8 @@ export function App() {
         </section>
 
         <div className="overlay-levels">
-          <AudioMeter compact label="Meet" deviceName={deviceLabel(audioDevices, "remote")} level={audioLevels.remote} />
-          <AudioMeter compact label="Mic" deviceName={deviceLabel(audioDevices, "mic")} level={audioLevels.mic} />
+          <AudioMeter compact label="Собеседник" deviceName={audioApplicationLabel(config)} level={audioLevels.remote} />
+          <AudioMeter compact label="Вы" deviceName={deviceLabel(audioDevices, "mic")} level={audioLevels.mic} />
         </div>
 
         <footer className="overlay-actions">
@@ -338,7 +407,7 @@ export function App() {
           <p>Помощник для живого собеседования и созвона.</p>
         </div>
         <div className="header-actions">
-          <button className="icon-button" onClick={() => setSetupOpen(true)} disabled={busy} title="Настройки">
+          <button className="icon-button" onClick={handleOpenSettings} disabled={busy} title="Настройки">
             <Settings size={18} />
           </button>
         </div>
@@ -373,22 +442,23 @@ export function App() {
           <div className="section-title">
             <MessageSquare size={18} />
             <h2>Диалог</h2>
+            <span className="section-caption">Собеседник — приложение, Вы — микрофон</span>
           </div>
-          <div className="messenger">
+          <div className="messenger" ref={messengerRef}>
             {turns.length === 0 ? (
               <p className="dialogue-empty">После включения здесь появятся реплики встречи.</p>
             ) : (
               turns.map((turn) => (
                 <div className={`message-bubble ${turn.source}`} key={turn.turnId}>
-                  <strong>{turn.source === "remote" ? "Meet" : "Мы"}</strong>
+                  <strong>{turn.source === "remote" ? "Собеседник" : "Вы"}</strong>
                   <span>{turn.text}</span>
                 </div>
               ))
             )}
           </div>
           <div className="dialogue-levels">
-            <AudioMeter compact label="Meet" deviceName={deviceLabel(audioDevices, "remote")} level={audioLevels.remote} />
-            <AudioMeter compact label="Мы" deviceName={deviceLabel(audioDevices, "mic")} level={audioLevels.mic} />
+            <AudioMeter compact label="Собеседник" deviceName={audioApplicationLabel(config)} level={audioLevels.remote} />
+            <AudioMeter compact label="Вы" deviceName={deviceLabel(audioDevices, "mic")} level={audioLevels.mic} />
           </div>
         </section>
       </section>
@@ -448,6 +518,10 @@ function deviceLabel(devices: AudioDevice[], source: AudioSource): string {
   return preferredAudioDevice(devices, source)?.name ?? (source === "remote" ? "Auto Meet output" : "Auto headset mic");
 }
 
+function audioApplicationLabel(config: AppConfig): string {
+  return config.audioApplication.title || config.audioApplication.executable || "Приложение не выбрано";
+}
+
 function preferredAudioDevice(devices: AudioDevice[], source: AudioSource): AudioDevice | undefined {
   return (
     devices.find((device) => device.source === source && device.recommended) ??
@@ -478,9 +552,13 @@ function audioModeLabel(mode: AudioMode): string {
     return "локально";
   }
   if (mode === "speechkit") {
-    return "SpeechKit, запасной";
+    return "SpeechKit, целыми фразами";
   }
-  return "Realtime API";
+  return "прямой поток Яндекса";
+}
+
+function audioSourceLabel(source: AudioSource): string {
+  return source === "remote" ? "собеседник" : "вы";
 }
 
 function conversationLabel(config: AppConfig): string {
@@ -535,6 +613,9 @@ function setupValidationMessage(config: AppConfig, apiKey: string): string | nul
   }
   if (!config.llmModel.trim()) {
     return "Выберите модель.";
+  }
+  if (!config.audioApplication.processId) {
+    return "Выберите приложение созвона.";
   }
   if (!config.hotkeys.overlayToggle.trim() || !config.hotkeys.audioToggle.trim()) {
     return "Укажите горячие клавиши.";

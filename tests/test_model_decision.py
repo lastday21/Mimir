@@ -26,7 +26,7 @@ class ModelDecisionTests(unittest.TestCase):
         snapshot = manager.snapshot()
 
         self.assertEqual(len(manager.calls), 1)
-        self.assertIn("Если подсказка не нужна", manager.calls[0][0].content)
+        self.assertIn("Верни [[SKIP]]", manager.calls[0][0].content)
         self.assertIsNone(snapshot["currentQuestion"])
         self.assertEqual(snapshot["metrics"]["questions"], [])
 
@@ -55,6 +55,40 @@ class ModelDecisionTests(unittest.TestCase):
 
         self.assertEqual(manager.calls, [])
 
+    def test_refinement_replaces_final_before_single_model_call(self) -> None:
+        manager = DecisionSessionManager(["[[ANSWER]]", "Назовите сроки и ответственного."])
+        manager.start()
+
+        manager.ingest_transcript("remote", "когда будет готова вчерне и в цвету")
+        manager.ingest_transcript(
+            "remote",
+            "Когда будет готово в черновом и чистовом виде?",
+            is_refinement=True,
+        )
+
+        self.wait_until(lambda: self.answer_is_done(manager))
+        snapshot = manager.snapshot()
+
+        self.assertEqual(len(manager.calls), 1)
+        self.assertEqual(
+            snapshot["memory"]["exchanges"][-1]["question"],
+            "Когда будет готово в черновом и чистовом виде?",
+        )
+
+    def test_unclear_marker_does_not_create_invented_answer(self) -> None:
+        manager = DecisionSessionManager(["[[UNC", "LEAR]]"])
+        manager.start()
+
+        manager.ingest_transcript("remote", "Тимур, а что там по вчернецвету?")
+        self.wait_until(lambda: manager.metrics().get("unclearUtterances") == 1)
+        snapshot = manager.snapshot()
+
+        self.assertIsNone(snapshot["currentQuestion"])
+        self.assertEqual(snapshot["metrics"]["questions"], [])
+        uncertain = [event for event in manager._events if event.event == "transcript_uncertain"]
+        self.assertEqual(len(uncertain), 1)
+        self.assertIn("Лучше переспросить", uncertain[0].payload["message"])
+
     def test_exact_repeated_remote_utterance_is_checked_once(self) -> None:
         manager = DecisionSessionManager(["[[SKIP]]"])
         manager.start()
@@ -78,6 +112,12 @@ class ModelDecisionTests(unittest.TestCase):
 
         self.assertIsNotNone(decision)
         self.assertEqual(decision.action, "skip")
+
+    def test_unclear_marker_is_parsed_before_stream_finishes(self) -> None:
+        decision = parse_model_decision("[[UNCLEAR]]")
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action, "unclear")
 
     @staticmethod
     def answer_is_done(manager: SessionManager) -> bool:

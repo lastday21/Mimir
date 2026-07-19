@@ -24,6 +24,9 @@ class RealtimeClientProtocol(Protocol):
     async def setup_session(self, instructions: str, sample_rate_hertz: int) -> None:
         ...
 
+    async def update_instructions(self, instructions: str) -> None:
+        ...
+
     async def append_audio(self, pcm: bytes) -> None:
         ...
 
@@ -121,6 +124,24 @@ class YandexRealtimeClient:
             {
                 "type": "input_audio_buffer.append",
                 "audio": base64.b64encode(pcm).decode("ascii"),
+            }
+        )
+
+    async def update_instructions(self, instructions: str) -> None:
+        normalized = instructions.strip()
+        if not normalized:
+            return
+        trace_live_event(
+            "realtime.session.instructions.update",
+            model=self.config.model,
+            instructions=normalized,
+        )
+        await self._send(
+            {
+                "type": "session.update",
+                "session": {
+                    "instructions": normalized,
+                },
             }
         )
 

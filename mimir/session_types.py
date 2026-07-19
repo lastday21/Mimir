@@ -11,6 +11,7 @@ from .dialogue import MIC_SOURCE, REMOTE_SOURCE
 
 MODEL_SKIP_MARKER = "[[SKIP]]"
 MODEL_ANSWER_MARKER = "[[ANSWER]]"
+MODEL_UNCLEAR_MARKER = "[[UNCLEAR]]"
 
 
 @dataclass(frozen=True)
@@ -64,12 +65,19 @@ def parse_model_decision(text: str, *, final: bool = False) -> ModelDecision | N
         return ModelDecision("skip")
     if upper.startswith(MODEL_ANSWER_MARKER):
         return ModelDecision("answer", cleaned[len(MODEL_ANSWER_MARKER) :].lstrip())
-    if MODEL_SKIP_MARKER.startswith(upper) or MODEL_ANSWER_MARKER.startswith(upper):
+    if upper.startswith(MODEL_UNCLEAR_MARKER):
+        return ModelDecision("unclear", cleaned[len(MODEL_UNCLEAR_MARKER) :].lstrip())
+    if any(
+        marker.startswith(upper)
+        for marker in (MODEL_SKIP_MARKER, MODEL_ANSWER_MARKER, MODEL_UNCLEAR_MARKER)
+    ):
         return None
     if final:
         plain = upper.strip(" \t\r\n.!:;[]")
         if plain in {"SKIP", "ПРОПУСТИТЬ", "НЕ ОТВЕЧАТЬ"}:
             return ModelDecision("skip")
+        if plain in {"UNCLEAR", "НЕРАЗБОРЧИВО", "НЕ УВЕРЕН"}:
+            return ModelDecision("unclear")
         return ModelDecision("answer", cleaned)
     if len(cleaned) >= len(MODEL_ANSWER_MARKER):
         return ModelDecision("answer", cleaned)

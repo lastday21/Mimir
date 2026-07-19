@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import threading
+from datetime import datetime, timezone
 from importlib import import_module
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +16,7 @@ from .audio import (
     LiveAudioController,
     RealtimeAudioConfig,
     RealtimeAudioController,
+    list_audio_applications,
     list_audio_devices,
 )
 from .audio.preflight import (
@@ -42,6 +44,7 @@ from .audio.runtime import (
     stop_live_audio as stop_audio,
     stop_live_session as stop_audio_session,
 )
+from .audio.recordings import CallRecordingStore
 from .config import AppConfig, load_config, save_config
 from .credentials import read_secret, write_secret
 from .hotkeys import normalize_hotkey_text
@@ -52,28 +55,47 @@ from .providers.base import ProviderError
 from .session import SessionEvent, SessionManager, sse_payload
 from .stt import AudioStreamConfig, SpeechKitStreamRunner, pcm_chunks_from_wav
 from .stt.local_vosk import LocalVoskRecognizer, local_vosk_status
+from .testing_replay import TestingReplayController
 
 
 HOST = "127.0.0.1"
 PORT = 8765
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "dist"
+CALL_RECORDINGS_ROOT = Path(__file__).resolve().parents[1] / ".work" / "call-recordings"
 ALLOWED_CORS_HEADERS = "Content-Type"
-SESSION_MANAGER = SessionManager()
+CALL_RECORDINGS = CallRecordingStore(CALL_RECORDINGS_ROOT)
+
+
+def record_session_event(event: str, payload: dict[str, Any]) -> None:
+    CALL_RECORDINGS.record_event(f"session.{event}", payload=payload)
+
+
+SESSION_MANAGER = SessionManager(record_session_event)
 LIVE_AUDIO = LiveAudioController(
     SESSION_MANAGER,
     YandexSpeechKitClient,
     fallback_starter=lambda config, reason: start_local_audio_fallback(config, reason),
+    recording_store=CALL_RECORDINGS,
 )
 LOCAL_AUDIO = LiveAudioController(
     SESSION_MANAGER,
     lambda _key: LocalVoskRecognizer(),
     mode="local_vosk",
     requires_api_key=False,
+    recording_store=CALL_RECORDINGS,
 )
 REALTIME_AUDIO = RealtimeAudioController(
     SESSION_MANAGER,
     YandexSpeechKitClient,
     fallback_starter=lambda config, reason: start_cloud_audio_fallback(config, reason),
+)
+TESTING_REPLAY = TestingReplayController(
+    CALL_RECORDINGS,
+    SESSION_MANAGER,
+    load_config,
+    read_secret,
+    YandexSpeechKitClient,
+    lambda _key: LocalVoskRecognizer(),
 )
 AUDIO_CONTROL_LOCK = threading.RLock()
 MAX_DEV_WAV_BYTES = 25_000_000
@@ -96,6 +118,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/audio/devices":
                 self.handle_audio_devices()
+                return
+            if parsed.path == "/api/audio/applications":
+                self.handle_audio_applications()
+                return
+            if parsed.path == "/api/testing":
+                self.send_json(testing_snapshot())
                 return
             if parsed.path == "/api/metrics/current":
                 self.send_json(SESSION_MANAGER.metrics())
@@ -136,6 +164,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.handle_session_transcript()
             elif parsed.path == "/api/session/stt/wav":
                 self.handle_session_stt_wav(parsed.query)
+            elif parsed.path == "/api/testing/replay/start":
+                self.handle_testing_replay_start()
+            elif parsed.path == "/api/testing/replay/stop":
+                self.send_json(stop_testing_replay())
+            elif parsed.path == "/api/testing/recordings/delete":
+                self.handle_testing_recording_delete()
             else:
                 self.send_error(404)
         except ProviderError as error:
@@ -155,6 +189,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if config.overlay_hotkey == config.audio_hotkey:
             raise ValueError("Hotkeys must be different")
         save_config(config)
+        REALTIME_AUDIO.refresh_settings()
         self.send_json(config_payload(config))
 
     def handle_yandex_key(self) -> None:
@@ -187,6 +222,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json({"available": True, "devices": devices})
         except AudioCaptureError as error:
             self.send_json({"available": False, "devices": [], "error": str(error)})
+
+    def handle_audio_applications(self) -> None:
+        try:
+            self.send_json({"available": True, "applications": list_audio_applications()})
+        except AudioCaptureError as error:
+            self.send_json({"available": False, "applications": [], "error": str(error)})
 
     def handle_session_stop(self) -> None:
         self.send_json(stop_live_session())
@@ -235,6 +276,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         )
         thread.start()
         self.send_json({"started": True, "jobId": job_id})
+
+    def handle_testing_replay_start(self) -> None:
+        payload = self.read_json()
+        recording_id = str(payload.get("recordingId") or "").strip()
+        if not recording_id:
+            raise ValueError("Не указана запись для проверки")
+        self.send_json(start_testing_replay(recording_id))
+
+    def handle_testing_recording_delete(self) -> None:
+        payload = self.read_json()
+        recording_id = str(payload.get("recordingId") or "").strip()
+        if not recording_id:
+            raise ValueError("Не указана запись для удаления")
+        self.send_json(delete_testing_recording(recording_id))
 
     def handle_session_events(self, query: str) -> None:
         params = parse_qs(query)
@@ -342,6 +397,9 @@ def start_live_audio(payload: dict[str, Any]) -> dict[str, object]:
 
 
 def start_live_audio_locked(payload: dict[str, Any]) -> dict[str, object]:
+    stop_testing_replay_locked()
+    if testing_replay_has_live_audio():
+        raise ValueError("Предыдущий звуковой поток еще завершается")
     return start_audio(payload, audio_runtime_dependencies(), parse_live_audio_request)
 
 
@@ -362,9 +420,11 @@ def config_payload(config: AppConfig) -> dict[str, Any]:
         "llmProvider": config.llm_provider,
         "llmModel": config.llm_model,
         "audioMode": config.audio_mode,
+        "audioApplication": config.audio_application.to_dict(),
         "ollamaBaseUrl": config.ollama_base_url,
         "profile": config.profile.to_dict(),
         "conversation": config.conversation.to_dict(),
+        "testing": config.testing.to_dict(),
         "setupCompleted": config.setup_completed,
         "hasYandexKey": bool(read_secret("yandex_ai_studio")),
         "hotkeys": {
@@ -372,6 +432,106 @@ def config_payload(config: AppConfig) -> dict[str, Any]:
             "audioToggle": config.audio_hotkey,
         },
     }
+
+
+def testing_snapshot() -> dict[str, Any]:
+    return {
+        "activeRecordingId": CALL_RECORDINGS.active_recording_id(),
+        "recordings": [testing_recording_payload(item) for item in CALL_RECORDINGS.list()],
+        "replay": TESTING_REPLAY.snapshot(),
+    }
+
+
+def testing_recording_payload(recording: dict[str, Any]) -> dict[str, Any]:
+    tracks = dict(recording.get("tracks") or {})
+    paths = dict(recording.get("paths") or {})
+
+    def has_track(source: str) -> bool:
+        track = tracks.get(source)
+        if not isinstance(track, dict):
+            return False
+        received = track.get("receivedAudio")
+        if received is None:
+            received = int(track.get("frames") or 0) > 0
+        path = paths.get(source)
+        return bool(received and path and Path(str(path)).is_file())
+
+    available_tracks = {
+        "remote": has_track("remote"),
+        "mic": has_track("mic"),
+    }
+    raw_status = str(recording.get("status") or "incomplete")
+    if raw_status == "recording":
+        status = "recording"
+    elif raw_status == "failed":
+        status = "failed"
+    elif raw_status == "complete" and all(available_tracks.values()):
+        status = "ready"
+    else:
+        status = "incomplete"
+    errors = recording.get("errors")
+    error = "; ".join(str(item) for item in errors) if isinstance(errors, list) else ""
+    created_at_ms = int(recording.get("createdAtMs") or 0)
+    duration_ms = int(recording.get("durationMs") or 0)
+    if status == "recording" and created_at_ms:
+        duration_ms = max(duration_ms, int(datetime.now(tz=timezone.utc).timestamp() * 1_000) - created_at_ms)
+    started_at = datetime.fromtimestamp(created_at_ms / 1_000, tz=timezone.utc).isoformat()
+    return {
+        "id": str(recording.get("id") or ""),
+        "startedAt": started_at,
+        "durationMs": duration_ms,
+        "status": status,
+        "tracks": available_tracks,
+        "sizeBytes": int(recording.get("sizeBytes") or 0),
+        "error": error,
+    }
+
+
+def start_testing_replay(recording_id: str) -> dict[str, Any]:
+    with AUDIO_CONTROL_LOCK:
+        if TESTING_REPLAY.is_running() or testing_replay_has_live_audio():
+            raise ValueError("Предыдущая повторная проверка еще завершается")
+        stop_audio_controllers(audio_runtime_dependencies())
+        waiter = threading.Event()
+        for _ in range(60):
+            if CALL_RECORDINGS.active_recording_id() is None:
+                break
+            waiter.wait(0.05)
+        if CALL_RECORDINGS.active_recording_id() is not None:
+            raise ValueError("Текущая запись еще завершается. Повторите через несколько секунд")
+        return TESTING_REPLAY.start(recording_id)
+
+
+def stop_testing_replay() -> dict[str, Any]:
+    with AUDIO_CONTROL_LOCK:
+        return stop_testing_replay_locked()
+
+
+def stop_testing_replay_locked() -> dict[str, Any]:
+    if TESTING_REPLAY.is_running() or testing_replay_has_live_audio():
+        TESTING_REPLAY.stop()
+        return TESTING_REPLAY.wait(timeout=5)
+    return TESTING_REPLAY.snapshot()
+
+
+def testing_replay_has_live_audio() -> bool:
+    checker = getattr(TESTING_REPLAY, "has_live_audio", None)
+    return bool(checker()) if callable(checker) else False
+
+
+def delete_testing_recording(recording_id: str) -> dict[str, Any]:
+    with AUDIO_CONTROL_LOCK:
+        if CALL_RECORDINGS.active_recording_id() == recording_id:
+            raise ValueError("Нельзя удалить запись, пока она создается")
+        replay = TESTING_REPLAY.snapshot()
+        if (
+            replay.get("recordingId") == recording_id
+            and (replay.get("state") == "running" or testing_replay_has_live_audio())
+        ):
+            raise ValueError("Сначала остановите повторную проверку")
+        if not CALL_RECORDINGS.delete(recording_id):
+            raise ValueError("Запись не найдена или не может быть удалена")
+        return testing_snapshot()
 
 
 def model_payload(model: ModelInfo) -> dict[str, Any]:
@@ -396,6 +556,7 @@ def preflight_dependencies() -> PreflightDependencies:
         load_config=load_config,
         read_secret=read_secret,
         list_audio_devices=list_audio_devices,
+        list_audio_applications=list_audio_applications,
         local_vosk_status=local_vosk_status,
         ollama_client=OllamaClient,
         select_preferred_model=select_preferred_model,
@@ -425,8 +586,22 @@ def normalize_live_audio_source(source: str) -> str:
     return normalize_audio_source(source)
 
 
-def add_device_checks(checks: list[dict[str, Any]], sources: list[str], device_ids: dict[str, str]) -> None:
-    add_audio_device_checks(checks, sources, device_ids, list_audio_devices)
+def add_device_checks(
+    checks: list[dict[str, Any]],
+    sources: list[str],
+    device_ids: dict[str, str],
+    application_process_id: int | None = None,
+) -> None:
+    if application_process_id is None:
+        application_process_id = load_config().audio_application.process_id
+    add_audio_device_checks(
+        checks,
+        sources,
+        device_ids,
+        list_audio_devices,
+        application_process_id=application_process_id,
+        list_audio_applications=list_audio_applications,
+    )
 
 
 def add_import_check(checks: list[dict[str, Any]], name: str, module: str, error: str) -> None:
@@ -438,7 +613,11 @@ def add_preflight_check(checks: list[dict[str, Any]], name: str, ok: bool, detai
 
 
 def audio_is_running() -> bool:
-    return runtime_audio_is_running(audio_runtime_dependencies())
+    return (
+        TESTING_REPLAY.is_running()
+        or testing_replay_has_live_audio()
+        or runtime_audio_is_running(audio_runtime_dependencies())
+    )
 
 
 def stop_all_audio() -> None:
@@ -447,21 +626,25 @@ def stop_all_audio() -> None:
 
 
 def stop_all_audio_locked() -> None:
+    stop_testing_replay_locked()
     stop_audio_controllers(audio_runtime_dependencies())
 
 
 def stop_live_audio() -> dict[str, object]:
     with AUDIO_CONTROL_LOCK:
+        stop_testing_replay_locked()
         return stop_audio(audio_runtime_dependencies())
 
 
 def pause_live_session() -> dict[str, Any]:
     with AUDIO_CONTROL_LOCK:
+        stop_testing_replay_locked()
         return pause_audio_session(audio_runtime_dependencies())
 
 
 def stop_live_session() -> dict[str, Any]:
     with AUDIO_CONTROL_LOCK:
+        stop_testing_replay_locked()
         return stop_audio_session(audio_runtime_dependencies())
 
 

@@ -1,6 +1,12 @@
 import unittest
 
-from mimir.config import AppConfig, ConversationSettings, UserProfile
+from mimir.config import (
+    AppConfig,
+    AudioApplicationSettings,
+    ConversationSettings,
+    TestingSettings as AppTestingSettings,
+    UserProfile,
+)
 
 
 class AppConfigTests(unittest.TestCase):
@@ -24,22 +30,22 @@ class AppConfigTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(config.audio_mode, "yandex_realtime")
+        self.assertEqual(config.audio_mode, "speechkit")
 
-    def test_old_speechkit_mode_migrates_to_realtime(self) -> None:
+    def test_old_realtime_mode_migrates_to_speechkit(self) -> None:
         config = AppConfig.from_dict(
             {
                 "llmProvider": "yandex_ai_studio",
-                "audioMode": "speechkit",
+                "audioMode": "yandex_realtime",
             }
         )
 
-        self.assertEqual(config.audio_mode, "yandex_realtime")
+        self.assertEqual(config.audio_mode, "speechkit")
 
-    def test_internal_speechkit_mode_is_not_saved_as_user_choice(self) -> None:
+    def test_speechkit_mode_is_saved_as_user_choice(self) -> None:
         config = AppConfig(audio_mode="speechkit")
 
-        self.assertEqual(config.to_dict()["audioMode"], "yandex_realtime")
+        self.assertEqual(config.to_dict()["audioMode"], "speechkit")
 
     def test_profile_and_conversation_round_trip(self) -> None:
         config = AppConfig(
@@ -55,6 +61,12 @@ class AppConfigTests(unittest.TestCase):
                 goal="Понимать, что от меня требуется",
                 context="Еженедельная встреча команды",
             ),
+            audio_application=AudioApplicationSettings(
+                process_id=42,
+                executable="meeting.exe",
+                title="Рабочий созвон",
+            ),
+            testing=AppTestingSettings(enabled=True),
             setup_completed=True,
         )
 
@@ -64,7 +76,16 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(restored.profile.projects, "Сервис обработки заказов")
         self.assertEqual(restored.conversation.mode, "meeting")
         self.assertEqual(restored.conversation.goal, "Понимать, что от меня требуется")
+        self.assertEqual(restored.audio_application.process_id, 42)
+        self.assertEqual(restored.audio_application.executable, "meeting.exe")
+        self.assertTrue(restored.testing.enabled)
         self.assertTrue(restored.setup_completed)
+
+    def test_testing_is_disabled_by_default(self) -> None:
+        config = AppConfig.from_dict({})
+
+        self.assertFalse(config.testing.enabled)
+        self.assertEqual(config.to_dict()["testing"], {"enabled": False})
 
     def test_unknown_conversation_mode_uses_interview(self) -> None:
         config = AppConfig.from_dict({"conversation": {"mode": "unknown"}})

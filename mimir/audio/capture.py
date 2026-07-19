@@ -68,6 +68,7 @@ class AudioCaptureConfig:
     sample_rate_hertz: int = 16_000
     chunk_duration_ms: int = 200
     device_id: str | None = None
+    process_id: int | None = None
 
 
 class SoundcardPcmSource:

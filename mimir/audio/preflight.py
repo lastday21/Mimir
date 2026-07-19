@@ -18,6 +18,7 @@ class PreflightDependencies:
     select_preferred_model: Callable[[list[Any]], Any]
     import_module: Callable[[str], Any]
     audio_is_running: Callable[[], bool]
+    list_audio_applications: Callable[[], list[dict[str, Any]]] = lambda: []
 
 
 def parse_live_audio_request(
@@ -32,9 +33,21 @@ def parse_live_audio_request(
     device_ids = payload.get("deviceIds") or {}
     if not isinstance(device_ids, dict):
         raise ValueError("deviceIds must be an object")
-    mode = str(payload.get("mode") or load_config().audio_mode).strip().lower()
+    config = load_config()
+    mode = str(payload.get("mode") or config.audio_mode).strip().lower()
     if mode not in {"yandex_realtime", "speechkit", "local_vosk"}:
         raise ValueError("audio mode must be yandex_realtime, speechkit, or local_vosk")
+    try:
+        application_process_id = int(
+            payload.get("applicationProcessId")
+            or getattr(getattr(config, "audio_application", None), "process_id", 0)
+            or 0
+        )
+    except (TypeError, ValueError):
+        application_process_id = 0
+    saved_testing = getattr(getattr(config, "testing", None), "enabled", False)
+    requested_testing = payload.get("recordTesting")
+    record_testing = bool(saved_testing) if requested_testing is None else requested_testing is True
     return (
         mode,
         {
@@ -44,6 +57,8 @@ def parse_live_audio_request(
             "chunk_duration_ms": int(payload.get("chunkDurationMs") or 200),
             "vad_enabled": bool(payload.get("vadEnabled", True)),
             "device_ids": {str(key): str(value) for key, value in device_ids.items()},
+            "application_process_id": max(0, application_process_id),
+            "record_testing": record_testing,
         },
     )
 
@@ -55,6 +70,8 @@ def build_live_audio_preflight(
     mode, common_config = parse_live_audio_request(payload, dependencies.load_config)
     sources = list(common_config["sources"])
     device_ids = dict(common_config["device_ids"])
+    application_process_id = int(common_config["application_process_id"])
+    record_testing = bool(common_config["record_testing"])
     checks: list[dict[str, Any]] = []
 
     audio_running = dependencies.audio_is_running()
@@ -66,17 +83,24 @@ def build_live_audio_preflight(
     )
     if mode == "yandex_realtime":
         config = dependencies.load_config()
+        folder_ready = bool(config.yandex_folder_id.strip())
         add_preflight_check(
             checks,
             "yandex_folder_id",
-            bool(config.yandex_folder_id.strip()),
-            "Yandex folder ID is missing",
+            folder_ready,
+            "Yandex folder is configured" if folder_ready else "Yandex folder ID is missing",
+        )
+        answer_key_ready = bool(
+            dependencies.read_secret("yandex_ai_studio")
+            or dependencies.read_secret("yandex_speechkit")
         )
         add_preflight_check(
             checks,
             "yandex_ai_studio_key",
-            bool(dependencies.read_secret("yandex_ai_studio") or dependencies.read_secret("yandex_speechkit")),
-            "Yandex AI Studio API key is missing",
+            answer_key_ready,
+            "Yandex AI Studio key is configured"
+            if answer_key_ready
+            else "Yandex AI Studio API key is missing",
         )
         add_import_check(
             checks,
@@ -88,29 +112,43 @@ def build_live_audio_preflight(
         if "mic" in sources:
             add_speechkit_checks(checks, dependencies)
     elif mode == "speechkit":
+        add_yandex_answer_checks(checks, dependencies)
         add_speechkit_checks(checks, dependencies)
     elif mode == "local_vosk":
         add_local_stt_checks(checks, dependencies)
         add_ollama_checks(checks, dependencies)
 
-    add_device_checks(checks, sources, device_ids, dependencies.list_audio_devices)
+    add_device_checks(
+        checks,
+        sources,
+        device_ids,
+        dependencies.list_audio_devices,
+        application_process_id=application_process_id,
+        list_audio_applications=dependencies.list_audio_applications,
+    )
     errors = [str(check["detail"]) for check in checks if not check["ok"]]
     return {
         "ok": not errors,
         "mode": mode,
         "sources": sources,
         "deviceIds": device_ids,
+        "applicationProcessId": application_process_id,
+        "recordTesting": record_testing,
         "checks": checks,
         "errors": errors,
     }
 
 
 def add_speechkit_checks(checks: list[dict[str, Any]], dependencies: PreflightDependencies) -> None:
+    key_ready = bool(
+        dependencies.read_secret("yandex_speechkit")
+        or dependencies.read_secret("yandex_ai_studio")
+    )
     add_preflight_check(
         checks,
         "yandex_speechkit_key",
-        bool(dependencies.read_secret("yandex_speechkit") or dependencies.read_secret("yandex_ai_studio")),
-        "Yandex SpeechKit API key is missing",
+        key_ready,
+        "Yandex SpeechKit key is configured" if key_ready else "Yandex SpeechKit API key is missing",
     )
     add_import_check(
         checks,
@@ -125,6 +163,27 @@ def add_speechkit_checks(checks: list[dict[str, Any]], dependencies: PreflightDe
         "yandex.cloud.ai.stt.v3.stt_service_pb2_grpc",
         "SpeechKit stubs are missing",
         dependencies.import_module,
+    )
+
+
+def add_yandex_answer_checks(checks: list[dict[str, Any]], dependencies: PreflightDependencies) -> None:
+    config = dependencies.load_config()
+    folder_ready = bool(config.yandex_folder_id.strip())
+    add_preflight_check(
+        checks,
+        "yandex_folder_id",
+        folder_ready,
+        "Yandex folder is configured" if folder_ready else "Yandex folder ID is missing",
+    )
+    key_ready = bool(
+        dependencies.read_secret("yandex_ai_studio")
+        or dependencies.read_secret("yandex_speechkit")
+    )
+    add_preflight_check(
+        checks,
+        "yandex_ai_studio_key",
+        key_ready,
+        "Yandex AI Studio key is configured" if key_ready else "Yandex AI Studio API key is missing",
     )
 
 
@@ -173,7 +232,38 @@ def add_device_checks(
     sources: list[str],
     device_ids: dict[str, str],
     list_audio_devices: Callable[[], list[dict[str, Any]]],
+    *,
+    application_process_id: int = 0,
+    list_audio_applications: Callable[[], list[dict[str, Any]]] = lambda: [],
 ) -> None:
+    if "remote" in sources:
+        try:
+            applications = list_audio_applications()
+        except AudioCaptureError as error:
+            add_preflight_check(checks, "remote_application", False, str(error))
+        else:
+            selected = next(
+                (
+                    application
+                    for application in applications
+                    if int(application.get("processId") or 0) == application_process_id
+                ),
+                None,
+            )
+            if selected is None:
+                detail = (
+                    "Выбранное приложение созвона не запущено"
+                    if application_process_id
+                    else "Выберите приложение созвона в настройках"
+                )
+                add_preflight_check(checks, "remote_application", False, detail)
+            else:
+                name = str(selected.get("title") or selected.get("executable") or application_process_id)
+                add_preflight_check(checks, "remote_application", True, f"Приложение созвона: {name}")
+
+    if "mic" not in sources:
+        return
+
     try:
         devices = list_audio_devices()
     except AudioCaptureError as error:
@@ -182,6 +272,8 @@ def add_device_checks(
 
     add_preflight_check(checks, "audio_devices", True, f"{len(devices)} capture devices available")
     for source in sources:
+        if source == "remote":
+            continue
         source_devices = [device for device in devices if device.get("source") == source]
         device_id = device_ids.get(source)
         if device_id:

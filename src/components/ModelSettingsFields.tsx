@@ -1,5 +1,5 @@
 import { Loader2 } from "lucide-react";
-import { AppConfig, AudioMode, ModelInfo, Provider } from "../api";
+import { AppConfig, AudioApplication, AudioMode, ModelInfo, Provider } from "../api";
 
 const PROVIDER_NAMES: Record<Provider, string> = {
   yandex_ai_studio: "Yandex AI Studio",
@@ -7,22 +7,24 @@ const PROVIDER_NAMES: Record<Provider, string> = {
 };
 
 const AUDIO_MODE_NAMES: Record<AudioMode, string> = {
-  yandex_realtime: "Яндекс Realtime — минимальная задержка",
-  speechkit: "SpeechKit — запасной облачный путь",
+  yandex_realtime: "Прямой поток Яндекса — опытный режим",
+  speechkit: "SpeechKit — распознавание целыми фразами",
   local_vosk: "Локально — Vosk и Ollama"
 };
 
-const SELECTABLE_AUDIO_MODES: AudioMode[] = ["yandex_realtime", "local_vosk"];
+const SELECTABLE_AUDIO_MODES: AudioMode[] = ["speechkit", "local_vosk"];
 
 interface ModelSettingsFieldsProps {
   apiKey: string;
   busy: boolean;
   config: AppConfig;
+  audioApplications: AudioApplication[];
   models: ModelInfo[];
   onApiKeyChange: (value: string) => void;
   onAudioModeChange: (mode: AudioMode) => void;
   onConfigChange: (config: AppConfig) => void;
   onLoadModels: () => void;
+  onLoadAudioApplications: () => void;
   onProviderChange: (provider: Provider) => void;
 }
 
@@ -30,11 +32,13 @@ export function ModelSettingsFields({
   apiKey,
   busy,
   config,
+  audioApplications,
   models,
   onApiKeyChange,
   onAudioModeChange,
   onConfigChange,
   onLoadModels,
+  onLoadAudioApplications,
   onProviderChange
 }: ModelSettingsFieldsProps) {
   function updateHotkey(name: keyof AppConfig["hotkeys"], value: string) {
@@ -47,12 +51,52 @@ export function ModelSettingsFields({
     });
   }
 
+  function selectAudioApplication(processId: number) {
+    const application = audioApplications.find((item) => item.processId === processId);
+    onConfigChange({
+      ...config,
+      audioApplication: application ?? { processId: 0, executable: "", title: "" }
+    });
+  }
+
+  const selectedApplicationAvailable = audioApplications.some(
+    (application) => application.processId === config.audioApplication.processId
+  );
+
   return (
     <section className="settings-section">
       <div className="settings-subtitle settings-subtitle-compact">
         <h3>Модель и звук</h3>
         <p>Выберите, где распознавать речь и готовить ответы.</p>
       </div>
+
+      <div className="audio-application-settings">
+        <label>
+          Приложение созвона
+          <select
+            value={config.audioApplication.processId || ""}
+            onChange={(event) => selectAudioApplication(Number(event.target.value))}
+          >
+            <option value="">Выберите приложение</option>
+            {!selectedApplicationAvailable && config.audioApplication.processId > 0 && (
+              <option value={config.audioApplication.processId}>
+                Недоступно — {config.audioApplication.title || config.audioApplication.executable}
+              </option>
+            )}
+            {audioApplications.map((application) => (
+              <option key={application.processId} value={application.processId}>
+                {application.title} — {application.executable}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button type="button" onClick={onLoadAudioApplications} disabled={busy}>
+          Обновить список
+        </button>
+      </div>
+      <p className="setup-note">
+        Mimir слушает только выбранную программу и её дочерние процессы. Наушники и колонки на захват не влияют.
+      </p>
 
       <div className="settings-grid">
         <label>
