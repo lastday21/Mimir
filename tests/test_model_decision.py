@@ -89,6 +89,43 @@ class ModelDecisionTests(unittest.TestCase):
         self.assertEqual(len(uncertain), 1)
         self.assertIn("Лучше переспросить", uncertain[0].payload["message"])
 
+    def test_known_garbled_question_is_not_sent_to_model(self) -> None:
+        for utterance in (
+            "Что такое когда восстающий вентиляционный",
+            "Что такое тогда восстающий вентиляционный",
+        ):
+            with self.subTest(utterance=utterance):
+                manager = DecisionSessionManager(["[[ANSWER]]Придуманный ответ"])
+                manager.start()
+
+                manager.ingest_transcript("remote", utterance)
+                self.wait_until(lambda: manager.metrics().get("unclearUtterances") == 1)
+
+                self.assertEqual(manager.calls, [])
+                self.assertIsNone(manager.snapshot()["currentQuestion"])
+
+    def test_garbled_question_closes_previous_answer_binding(self) -> None:
+        manager = DecisionSessionManager(["[[ANSWER]]", "Назовите шахтный ствол."])
+        manager.start()
+        manager.ingest_transcript(
+            "remote",
+            "Какие вертикальные выработки вы можете привести в пример?",
+        )
+        self.wait_until(lambda: self.answer_is_done(manager))
+
+        manager.ingest_transcript(
+            "remote",
+            "Что такое тогда восстающий вентиляционный",
+        )
+        self.wait_until(lambda: manager.metrics().get("unclearUtterances") == 1)
+        manager.ingest_transcript("mic", "Он направлен к поверхности")
+
+        snapshot = manager.snapshot()
+        self.assertIsNone(snapshot["currentQuestion"])
+        self.assertEqual(snapshot["memory"]["exchanges"][-1]["userAnswer"], "")
+        self.assertTrue(snapshot["memory"]["turns"][-2]["uncertain"])
+        self.assertNotIn("восстающий вентиляционный", manager._memory.summary_source()[0])
+
     def test_exact_repeated_remote_utterance_is_checked_once(self) -> None:
         manager = DecisionSessionManager(["[[SKIP]]"])
         manager.start()

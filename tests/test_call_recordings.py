@@ -32,6 +32,101 @@ class FakeTime:
 
 
 class CallRecordingStoreTests(unittest.TestCase):
+    def test_preserves_intermediate_gaps_and_wall_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CallRecordingStore(temporary, chunk_duration_ms=100)
+            store.start("timeline", started_monotonic_ns=0)
+            first = pcm(1000, 1600)
+            second = pcm(2000, 1600)
+            for source in ("remote", "mic"):
+                self.assertTrue(store.write(source, first, captured_at_ns=100_000_000))
+                self.assertTrue(store.write(source, second, captured_at_ns=400_000_000))
+
+            completed = store.finish(finished_monotonic_ns=500_000_000)
+
+            self.assertEqual(completed["status"], "incomplete")
+            self.assertEqual(completed["durationMs"], 500)
+            self.assertEqual(completed["wallDurationMs"], 500)
+            for source in ("remote", "mic"):
+                track = completed["tracks"][source]
+                self.assertEqual(track["insertedGapFrames"], 3200)
+                self.assertEqual(track["insertedGapMs"], 200)
+                self.assertEqual(track["tailPaddingFrames"], 1600)
+                self.assertEqual(track["frames"], 8000)
+                with wave.open(completed["paths"][source], "rb") as reader:
+                    content = reader.readframes(reader.getnframes())
+                self.assertEqual(content[: 1600 * 2], first)
+                self.assertEqual(content[1600 * 2 : 4800 * 2], pcm(0, 3200))
+                self.assertEqual(content[4800 * 2 : 6400 * 2], second)
+
+            events = [
+                json.loads(line)
+                for line in Path(completed["eventsPath"]).read_text(encoding="utf-8").splitlines()
+            ]
+            gaps = [event for event in events if event["event"] == "audio.gap"]
+            self.assertEqual(len(gaps), 2)
+            self.assertTrue(all(event["gapMs"] == 200 for event in gaps))
+
+    def test_marks_audio_dropped_before_recognition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CallRecordingStore(temporary, chunk_duration_ms=100)
+            store.start("stream-drop", started_monotonic_ns=0)
+            for source in ("remote", "mic"):
+                store.write(source, pcm(1000, 1600), captured_at_ns=100_000_000)
+            self.assertTrue(
+                store.record_stream_drop("remote", 1600, captured_at_ns=200_000_000)
+            )
+
+            completed = store.finish(finished_monotonic_ns=200_000_000)
+
+            self.assertEqual(completed["status"], "incomplete")
+            self.assertTrue(completed["hasRecognitionAudioLoss"])
+            self.assertEqual(completed["tracks"]["remote"]["streamDroppedFrames"], 1600)
+            events = Path(completed["eventsPath"]).read_text(encoding="utf-8")
+            self.assertIn('"event":"audio.stream_drop"', events)
+
+    def test_marks_raw_recording_queue_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CallRecordingStore(temporary, chunk_duration_ms=100)
+            store.start("capture-drop", started_monotonic_ns=0)
+            for source in ("remote", "mic"):
+                store.write(source, pcm(1000, 1600), captured_at_ns=100_000_000)
+            self.assertTrue(
+                store.record_capture_drop("mic", 3200, captured_at_ns=200_000_000)
+            )
+
+            completed = store.finish(finished_monotonic_ns=200_000_000)
+
+            self.assertEqual(completed["status"], "incomplete")
+            self.assertTrue(completed["hasCaptureAudioLoss"])
+            self.assertEqual(completed["tracks"]["mic"]["captureDroppedFrames"], 3200)
+            events = Path(completed["eventsPath"]).read_text(encoding="utf-8")
+            self.assertIn('"event":"audio.capture_drop"', events)
+
+    def test_reports_long_silence_but_only_marks_all_zero_track_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CallRecordingStore(temporary, chunk_duration_ms=100)
+            store.start("silent-tail", started_monotonic_ns=0)
+            store.write("remote", pcm(1000, 1600), captured_at_ns=100_000_000)
+            store.write("remote", pcm(0, 256_000), captured_at_ns=16_100_000_000)
+            store.write("mic", pcm(1000, 257_600), captured_at_ns=16_100_000_000)
+
+            completed = store.finish(finished_monotonic_ns=16_100_000_000)
+
+            self.assertEqual(completed["status"], "complete")
+            remote = completed["tracks"]["remote"]
+            self.assertEqual(remote["nonSilentFrames"], 1600)
+            self.assertEqual(remote["lastNonSilentAtMs"], 100)
+            self.assertEqual(remote["silentTailMs"], 16_000)
+
+            store.start("all-zero", started_monotonic_ns=0)
+            store.write("remote", pcm(0, 1600), captured_at_ns=100_000_000)
+            store.write("mic", pcm(1000, 1600), captured_at_ns=100_000_000)
+            all_zero = store.finish(finished_monotonic_ns=100_000_000)
+            self.assertEqual(all_zero["status"], "incomplete")
+            self.assertEqual(all_zero["tracks"]["remote"]["nonSilentFrames"], 0)
+            self.assertIsNone(all_zero["tracks"]["remote"]["lastNonSilentAtMs"])
+
     def test_writes_two_synchronized_tracks_and_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = CallRecordingStore(temporary, chunk_duration_ms=100)
@@ -104,6 +199,30 @@ class CallRecordingStoreTests(unittest.TestCase):
             self.assertEqual(completed["status"], "failed")
             self.assertEqual(completed["durationMs"], 0)
             self.assertFalse(store.write("remote", b"12"))
+
+    def test_late_chunk_cannot_enter_next_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CallRecordingStore(temporary)
+            store.start("first", started_monotonic_ns=0)
+            for source in ("remote", "mic"):
+                store.write(
+                    source,
+                    pcm(100, 1600),
+                    captured_at_ns=100_000_000,
+                    recording_id="first",
+                )
+            store.finish(finished_monotonic_ns=100_000_000)
+            store.start("second", started_monotonic_ns=200_000_000)
+
+            accepted = store.write(
+                "remote",
+                pcm(200, 1600),
+                captured_at_ns=300_000_000,
+                recording_id="first",
+            )
+
+            self.assertFalse(accepted)
+            store.finish(finished_monotonic_ns=300_000_000)
 
     def test_safe_ids_reports_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

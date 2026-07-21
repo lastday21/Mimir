@@ -9,42 +9,116 @@ from mimir.session import SessionManager
 
 
 class SessionControlTests(unittest.TestCase):
-    def test_cross_source_duplicate_prefers_remote_turn(self) -> None:
+    def test_identical_cross_source_turns_are_both_preserved(self) -> None:
         manager = SessionManager()
         manager.start()
+        started_at_ms = int(time.time() * 1000)
 
-        manager.ingest_transcript("mic", "Добрый день", detect_question=False)
-        manager.ingest_transcript("remote", "Добрый день", detect_question=False)
+        manager.ingest_transcript(
+            "mic",
+            "Добрый день",
+            detect_question=False,
+            timestamp_ms=started_at_ms,
+            started_at_ms=started_at_ms,
+        )
+        manager.ingest_transcript(
+            "remote",
+            "Добрый день",
+            detect_question=False,
+            timestamp_ms=started_at_ms,
+            started_at_ms=started_at_ms,
+        )
 
         turns = manager.snapshot()["memory"]["turns"]
-        self.assertEqual([(turn["source"], turn["text"]) for turn in turns], [("remote", "Добрый день")])
+        self.assertEqual(
+            [(turn["source"], turn["text"]) for turn in turns],
+            [("mic", "Добрый день"), ("remote", "Добрый день")],
+        )
 
-    def test_remote_partial_prevents_echo_from_becoming_user_answer(self) -> None:
+    def test_partial_remote_turn_cannot_delete_finished_user_turn(self) -> None:
         manager = SessionManager()
         manager.start()
+        started_at_ms = int(time.time() * 1000)
 
+        manager.ingest_transcript(
+            "mic",
+            "Добрый день",
+            is_final=False,
+            detect_question=False,
+            timestamp_ms=started_at_ms,
+        )
+        manager.ingest_transcript(
+            "remote",
+            "добрый день",
+            is_final=False,
+            detect_question=False,
+            timestamp_ms=started_at_ms + 1_630,
+        )
+        user_result = manager.ingest_transcript(
+            "mic",
+            "Добрый день",
+            detect_question=False,
+            timestamp_ms=started_at_ms + 2_140,
+        )
+        remote_result = manager.ingest_transcript(
+            "remote",
+            "Добрый день, представьтесь, пожалуйста",
+            detect_question=False,
+            timestamp_ms=started_at_ms + 3_100,
+        )
+
+        self.assertFalse(user_result.get("skipped", False))
+        self.assertFalse(remote_result.get("skipped", False))
+        turns = manager.snapshot()["memory"]["turns"]
+        self.assertEqual(
+            [(turn["source"], turn["text"]) for turn in turns],
+            [
+                ("mic", "Добрый день"),
+                ("remote", "Добрый день, представьтесь, пожалуйста"),
+            ],
+        )
+
+    def test_two_finished_overlapping_turns_are_both_preserved(self) -> None:
+        manager = SessionManager()
+        manager.start()
+        started_at_ms = int(time.time() * 1000)
+
+        manager.ingest_transcript(
+            "mic",
+            "Сколько будет пять плюс пять",
+            is_final=False,
+            detect_question=False,
+            timestamp_ms=started_at_ms,
+        )
         manager.ingest_transcript(
             "remote",
             "Сколько будет пять плюс пять",
             is_final=False,
             detect_question=False,
+            timestamp_ms=started_at_ms + 300,
         )
-        result = manager.ingest_transcript(
+        user_result = manager.ingest_transcript(
             "mic",
             "Сколько будет 5 + 5",
             detect_question=False,
+            timestamp_ms=started_at_ms + 700,
         )
         manager.ingest_transcript(
             "remote",
             "Сколько будет 5 + 5",
             detect_question=False,
+            timestamp_ms=started_at_ms + 900,
         )
 
-        self.assertTrue(result["skipped"])
-        self.assertEqual(result["reason"], "cross_source_duplicate")
+        self.assertFalse(user_result.get("skipped", False))
         turns = manager.snapshot()["memory"]["turns"]
-        self.assertEqual(len(turns), 1)
-        self.assertEqual(turns[0]["source"], "remote")
+        self.assertEqual(
+            [(turn["source"], turn["text"]) for turn in turns],
+            [
+                ("mic", "Сколько будет 5 + 5"),
+                ("remote", "Сколько будет 5 + 5"),
+            ],
+        )
 
     def test_cross_source_filter_keeps_different_numbers(self) -> None:
         manager = SessionManager()
@@ -234,6 +308,35 @@ class ServerSessionControlTests(unittest.TestCase):
             self.assertEqual(lines[1], "event: session_snapshot")
             snapshot = json.loads(lines[2].removeprefix("data: "))
             self.assertEqual(snapshot["memory"]["turns"][-1]["text"], "Старое событие")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            server.SESSION_MANAGER = original_session
+
+    def test_event_stream_repairs_a_cursor_older_than_retained_events(self) -> None:
+        original_session = server.SESSION_MANAGER
+        manager = SessionManager()
+        manager.start()
+        for index in range(305):
+            manager.publish_status("test_event", {"index": index})
+        server.SESSION_MANAGER = manager
+        httpd = server.create_server(port=0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            host, port = httpd.server_address
+            connection = HTTPConnection(host, port, timeout=5)
+            connection.request("GET", "/api/session/events", headers={"Last-Event-ID": "1"})
+            response = connection.getresponse()
+            lines = [response.fp.readline().decode("utf-8").strip() for _ in range(4)]
+            connection.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(lines[1], "event: session_snapshot")
+            snapshot = json.loads(lines[2].removeprefix("data: "))
+            self.assertEqual(snapshot["eventSequence"], manager.snapshot()["eventSequence"])
         finally:
             httpd.shutdown()
             httpd.server_close()

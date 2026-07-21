@@ -2,10 +2,14 @@ import unittest
 
 from mimir.config import AppConfig, ConversationSettings, UserProfile
 from mimir.prompts import (
+    DIALOGUE_SUMMARY_SYSTEM_PROMPT,
+    REALTIME_SYSTEM_PROMPT,
+    TRANSCRIPT_DECISION_SYSTEM_PROMPT,
     build_dialogue_summary_messages,
     build_realtime_messages,
     build_realtime_session_instructions,
     build_transcript_decision_messages,
+    requires_transcript_clarification,
 )
 
 
@@ -74,6 +78,60 @@ class PromptContextTests(unittest.TestCase):
         self.assertIn("Тимур, проверь сборку", prompt)
         self.assertIn("Проверю сегодня", prompt)
         self.assertIn("Не погружаться в детали", prompt)
+
+    def test_live_prompts_do_not_guess_garbled_terms_or_endorse_fragments(self) -> None:
+        self.assertIn("не выдавай предположение", REALTIME_SYSTEM_PROMPT.casefold())
+        self.assertIn("что такое когда восстающий вентиляционный", TRANSCRIPT_DECISION_SYSTEM_PROMPT.casefold())
+        self.assertIn("[[unclear]]", TRANSCRIPT_DECISION_SYSTEM_PROMPT.casefold())
+        self.assertIn("не знает ответ", DIALOGUE_SUMMARY_SYSTEM_PROMPT.casefold())
+        self.assertIn("слова конкретного участника", DIALOGUE_SUMMARY_SYSTEM_PROMPT.casefold())
+
+    def test_known_garbled_mining_question_requires_clarification(self) -> None:
+        self.assertTrue(
+            requires_transcript_clarification(
+                "Что такое когда восстающий вентиляционный"
+            )
+        )
+        self.assertTrue(
+            requires_transcript_clarification(
+                "Что такое тогда восстающий вентиляционный"
+            )
+        )
+        self.assertFalse(
+            requires_transcript_clarification(
+                "Что такое вентиляционный восстающий?"
+            )
+        )
+
+    def test_mining_question_gets_verified_terms_reference(self) -> None:
+        messages = build_transcript_decision_messages(
+            "Чем вертикальная горная выработка отличается от горизонтальной?",
+            "",
+            self.config,
+        )
+
+        self.assertIn("ГОСТ Р 57719-2017", messages[0].content)
+        self.assertIn("нельзя выводить направление вдоль падения", messages[0].content)
+
+    def test_ordinary_work_question_does_not_get_mining_reference(self) -> None:
+        for question in (
+            "С какими трудностями столкнулся сотрудник?",
+            "Как вы выработали решение и оценили пластичность архитектуры?",
+            "Как прошло восстановление после сбоя?",
+            "Как рассчитывается выработка электроэнергии?",
+            "Каковы обязанности горничной?",
+            "Как проявляется горная болезнь?",
+            "Где начинается эта горная река?",
+            "Почему восстающий народ поддержал реформу?",
+        ):
+            with self.subTest(question=question):
+                messages = build_transcript_decision_messages(
+                    question,
+                    "",
+                    self.config,
+                )
+
+                self.assertNotIn("ГОСТ Р 57719-2017", messages[0].content)
 
 
 if __name__ == "__main__":

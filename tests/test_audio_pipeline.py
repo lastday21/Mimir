@@ -1,5 +1,6 @@
 import asyncio
 import os
+import struct
 import time
 import threading
 import unittest
@@ -7,11 +8,31 @@ from collections.abc import AsyncIterator
 from collections.abc import Iterable, Iterator
 from unittest.mock import patch
 
-from mimir.audio.capture import AudioCaptureConfig, float_frames_to_pcm16, list_audio_devices, select_loopback, select_microphone
+from mimir.audio.capture import (
+    AudioCaptureConfig,
+    AudioCaptureError,
+    float_frames_to_pcm16,
+    list_audio_devices,
+    select_loopback,
+    select_microphone,
+)
 from mimir.audio.applications import ProcessLoopbackPcmSource, _FloatStereoConverter, process_exists
-from mimir.audio.live import LiveAudioConfig, LiveAudioController, default_source_factory, normalize_sources
+from mimir.audio.live import (
+    LiveAudioConfig,
+    LiveAudioController,
+    _BufferedPcmCapture,
+    apply_pcm16_gain,
+    default_source_factory,
+    normalize_sources,
+)
 from mimir.audio.preflight import add_device_checks, parse_live_audio_request
 from mimir.audio.realtime import REALTIME_INSTRUCTIONS, RealtimeAudioConfig, RealtimeAudioController
+from mimir.audio.runtime import (
+    AudioRuntimeDependencies,
+    copy_live_audio_config,
+    start_cloud_audio_fallback_locked,
+    start_local_audio_fallback_locked,
+)
 from mimir.audio.vad import EnergyVadConfig, EnergyVadGate
 from mimir.dialogue import DialogueMemory, DialogueTurn
 from mimir.models import SpeechRecognitionResult
@@ -22,12 +43,80 @@ def pcm_constant(value: int, frames: int) -> bytes:
     return sample * frames
 
 
+class AudioConfigCopyTests(unittest.TestCase):
+    def test_live_fallback_keeps_custom_microphone_gain(self) -> None:
+        copied = copy_live_audio_config(LiveAudioConfig(mic_gain=1.5))
+
+        self.assertEqual(copied.mic_gain, 1.5)
+
+    def test_realtime_fallback_uses_safe_default_microphone_gain(self) -> None:
+        copied = copy_live_audio_config(RealtimeAudioConfig())
+
+        self.assertEqual(copied.mic_gain, 2.0)
+
+    def test_automatic_fallback_waits_for_old_audio_threads(self) -> None:
+        class FakeController:
+            def __init__(self, *, lingering: bool = False) -> None:
+                self.lingering = lingering
+                self.start_calls = 0
+
+            def stop(self) -> None:
+                pass
+
+            def has_live_threads(self) -> bool:
+                return self.lingering
+
+            def start(self, *_args) -> dict[str, object]:
+                self.start_calls += 1
+                return {"running": True}
+
+        class FakeSessionManager:
+            def set_answer_provider_override(self, _provider) -> None:
+                pass
+
+            def publish_status(self, _event, _payload) -> None:
+                pass
+
+        for fallback in ("cloud", "local"):
+            with self.subTest(fallback=fallback):
+                realtime = FakeController(lingering=True)
+                live = FakeController()
+                local = FakeController()
+                dependencies = AudioRuntimeDependencies(
+                    session_manager=FakeSessionManager(),
+                    live_audio=live,
+                    local_audio=local,
+                    realtime_audio=realtime,
+                    load_config=lambda: None,
+                    read_secret=lambda _name: "test-key",
+                )
+
+                with self.assertRaisesRegex(ValueError, "еще завершается"):
+                    if fallback == "cloud":
+                        start_cloud_audio_fallback_locked(
+                            RealtimeAudioConfig(),
+                            "ошибка основного режима",
+                            dependencies,
+                        )
+                    else:
+                        start_local_audio_fallback_locked(
+                            LiveAudioConfig(),
+                            "ошибка облачного режима",
+                            dependencies,
+                        )
+
+                self.assertEqual(live.start_calls, 0)
+                self.assertEqual(local.start_calls, 0)
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.started = False
         self.transcripts: list[tuple[str, str, bool]] = []
         self.events: list[tuple[str, dict[str, object]]] = []
         self.metric_events: list[tuple[str, str, int | bool | None]] = []
+        self.stt_refinements: list[tuple[str, bool, bool]] = []
+        self.external_questions: list[tuple[str, str, int]] = []
         self.memory = DialogueMemory()
 
     def start(self) -> dict[str, object]:
@@ -55,8 +144,26 @@ class FakeSession:
     def record_audio_chunk(self, source: str, byte_count: int) -> None:
         self.metric_events.append(("audio_chunk", source, byte_count))
 
-    def record_stt_result(self, source: str, is_final: bool) -> None:
+    def record_stt_result(
+        self,
+        source: str,
+        is_final: bool,
+        *,
+        is_refinement: bool = False,
+    ) -> int:
         self.metric_events.append(("stt", source, is_final))
+        self.stt_refinements.append((source, is_final, is_refinement))
+        return 1 if is_final and not is_refinement else 0
+
+    def record_external_question(
+        self,
+        question_id: str,
+        question: str,
+        *,
+        utterance_sequence: int = 0,
+        **_payload,
+    ) -> None:
+        self.external_questions.append((question_id, question, utterance_sequence))
 
     def realtime_context(self, max_turns: int = 12, max_chars: int = 1800) -> str:
         return self.memory.realtime_context(max_turns=max_turns, max_chars=max_chars)
@@ -104,14 +211,21 @@ class FakeRecordingStore:
         source: str,
         chunk: bytes,
         captured_at_ns: int,
+        recording_id: str = "",
     ) -> bool:
+        del recording_id
         self.writes.append((source, chunk, captured_at_ns))
         return True
 
     def record_event(self, _event: str, _payload: dict[str, object]) -> None:
         pass
 
-    def finish(self, *, error: str = "") -> dict[str, str]:
+    def finish(
+        self,
+        *,
+        error: str = "",
+        finished_monotonic_ns: int | None = None,
+    ) -> dict[str, str]:
         self.finishes += 1
         self.recording_id = ""
         return {"recordingId": "recording_test", "error": error}
@@ -153,6 +267,246 @@ class FakeSoundcard:
 
 
 class AudioPipelineTests(unittest.TestCase):
+    def test_buffered_capture_keeps_reading_and_marks_oldest_drops(self) -> None:
+        source_chunks = [pcm_constant(index, 1600) for index in range(1, 7)]
+        captured: list[bytes] = []
+        dropped: list[tuple[int, int]] = []
+        consumed: list[bytes] = []
+        first_consumed = threading.Event()
+        release_consumer = threading.Event()
+
+        class TrackingSource(FakePcmSource):
+            def chunks(self, _stop_event) -> Iterator[bytes]:
+                for chunk in self._chunks:
+                    captured.append(chunk)
+                    yield chunk
+
+        capture = _BufferedPcmCapture(
+            TrackingSource(source_chunks),
+            threading.Event(),
+            capacity=2,
+            on_drop=lambda frames, captured_at_ns: dropped.append((frames, captured_at_ns)),
+        )
+
+        def consume() -> None:
+            for item in capture.chunks():
+                consumed.append(item.pcm)
+                if len(consumed) == 1:
+                    first_consumed.set()
+                    release_consumer.wait(1)
+
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        self.assertTrue(first_consumed.wait(1))
+        deadline = time.monotonic() + 1
+        while len(captured) < len(source_chunks) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_consumer.set()
+        consumer.join(timeout=1)
+
+        self.assertFalse(consumer.is_alive())
+        self.assertEqual(captured, source_chunks)
+        self.assertTrue(dropped)
+        dropped_chunks = sum(frames for frames, _ in dropped) // 1600
+        self.assertEqual(dropped_chunks + len(consumed), len(source_chunks))
+        self.assertTrue(all(captured_at_ns > 0 for _, captured_at_ns in dropped))
+        self.assertEqual(consumed[-1], source_chunks[-1])
+
+    def test_buffered_capture_marks_recording_queue_overflow(self) -> None:
+        source_chunks = [pcm_constant(index, 1600) for index in range(1, 7)]
+        source_finished = threading.Event()
+        recording_started = threading.Event()
+        release_recording = threading.Event()
+        recorded: list[bytes] = []
+        recording_drops: list[tuple[int, int]] = []
+
+        class TrackingSource(FakePcmSource):
+            def chunks(self, _stop_event) -> Iterator[bytes]:
+                for index, chunk in enumerate(self._chunks):
+                    yield chunk
+                    if index == 0:
+                        recording_started.wait(1)
+                source_finished.set()
+
+        def record(item) -> None:
+            recorded.append(item.pcm)
+            if len(recorded) == 1:
+                recording_started.set()
+                release_recording.wait(1)
+
+        capture = _BufferedPcmCapture(
+            TrackingSource(source_chunks),
+            threading.Event(),
+            capacity=2,
+            on_capture=record,
+            on_capture_drop=lambda frames, captured_at_ns: recording_drops.append(
+                (frames, captured_at_ns)
+            ),
+        )
+        consumer = threading.Thread(target=lambda: list(capture.chunks()))
+        consumer.start()
+
+        self.assertTrue(recording_started.wait(1))
+        self.assertTrue(source_finished.wait(1))
+        release_recording.set()
+        consumer.join(timeout=1)
+
+        self.assertFalse(consumer.is_alive())
+        self.assertEqual(recorded[0], source_chunks[0])
+        self.assertEqual(recorded[-2:], source_chunks[-2:])
+        self.assertEqual(sum(frames for frames, _ in recording_drops), 3 * 1600)
+        self.assertTrue(all(captured_at_ns > 0 for _, captured_at_ns in recording_drops))
+
+    def test_buffered_capture_waits_for_recording_worker_before_finishing(self) -> None:
+        recording_started = threading.Event()
+        release_recording = threading.Event()
+
+        def blocked_recording(_item) -> None:
+            recording_started.set()
+            release_recording.wait(1)
+
+        capture = _BufferedPcmCapture(
+            FakePcmSource([pcm_constant(1000, 1600)]),
+            threading.Event(),
+            capacity=2,
+            on_capture=blocked_recording,
+        )
+        consumer = threading.Thread(target=lambda: list(capture.chunks()))
+
+        consumer.start()
+        self.assertTrue(recording_started.wait(1))
+        consumer.join(timeout=0.1)
+        self.assertTrue(consumer.is_alive())
+        release_recording.set()
+        consumer.join(timeout=1)
+        self.assertFalse(consumer.is_alive())
+
+    def test_pcm_gain_amplifies_and_saturates(self) -> None:
+        raw = b"".join(
+            value.to_bytes(2, "little", signed=True)
+            for value in (-20_000, -1_000, 1_000, 20_000)
+        )
+
+        amplified = apply_pcm16_gain(raw, 2.0)
+        values = [
+            int.from_bytes(amplified[index : index + 2], "little", signed=True)
+            for index in range(0, len(amplified), 2)
+        ]
+
+        self.assertEqual(values, [-32_768, -2_000, 2_000, 32_767])
+
+    def test_live_controller_starts_session_before_recording_with_revision(self) -> None:
+        order: list[str] = []
+
+        class OrderedSession(FakeSession):
+            def start(self) -> dict[str, object]:
+                order.append("session")
+                return super().start()
+
+        class OrderedStore(FakeRecordingStore):
+            def start(self, **payload) -> dict[str, str]:
+                order.append("recording")
+                return super().start(**payload)
+
+        session = OrderedSession()
+        store = OrderedStore()
+        controller = LiveAudioController(
+            session,
+            lambda _key: FakeRecognizer(),
+            lambda _source, _config: FakePcmSource([pcm_constant(1000, 1600)]),
+            recording_store=store,
+        )
+
+        controller.start(
+            LiveAudioConfig(sources=("remote",), record_testing=True, vad_enabled=False),
+            "test-key",
+        )
+        deadline = time.monotonic() + 1
+        while controller.snapshot()["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(order[:2], ["session", "recording"])
+        self.assertTrue(store.starts[0]["app_revision"])
+
+    def test_slow_recording_store_does_not_block_audio_source(self) -> None:
+        source_finished_at: list[float] = []
+
+        class TimedSource(FakePcmSource):
+            def chunks(self, _stop_event) -> Iterator[bytes]:
+                yield from self._chunks
+                source_finished_at.append(time.monotonic())
+
+        class SlowStore(FakeRecordingStore):
+            def write(
+                self,
+                source: str,
+                chunk: bytes,
+                captured_at_ns: int,
+                recording_id: str = "",
+            ) -> bool:
+                time.sleep(0.03)
+                return super().write(source, chunk, captured_at_ns, recording_id)
+
+        source_chunks = [pcm_constant(1000, 1600) for _ in range(20)]
+        session = FakeSession()
+        store = SlowStore()
+        controller = LiveAudioController(
+            session,
+            lambda _key: FakeRecognizer(),
+            lambda _source, _config: TimedSource(source_chunks),
+            recording_store=store,
+        )
+        started_at = time.monotonic()
+
+        controller.start(
+            LiveAudioConfig(sources=("remote",), record_testing=True, vad_enabled=False),
+            "test-key",
+        )
+        deadline = time.monotonic() + 1
+        while not source_finished_at and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        self.assertTrue(source_finished_at)
+        self.assertLess(source_finished_at[0] - started_at, 0.2)
+        deadline = time.monotonic() + 2
+        while controller.snapshot()["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(store.writes), len(source_chunks))
+
+    def test_microphone_gain_does_not_change_raw_recording(self) -> None:
+        recognized: list[bytes] = []
+
+        class CapturingRecognizer(FakeRecognizer):
+            def stream_lpcm(self, chunks, *, language: str, sample_rate_hertz: int):
+                recognized.extend(chunks)
+                return iter(())
+
+        raw = pcm_constant(1000, 1600)
+        session = FakeSession()
+        store = FakeRecordingStore()
+        controller = LiveAudioController(
+            session,
+            lambda _key: CapturingRecognizer(),
+            lambda _source, _config: FakePcmSource([raw]),
+            recording_store=store,
+        )
+
+        controller.start(
+            LiveAudioConfig(
+                sources=("mic",),
+                record_testing=True,
+                vad_enabled=False,
+                mic_gain=2.0,
+            ),
+            "test-key",
+        )
+        deadline = time.monotonic() + 1
+        while controller.snapshot()["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual([item[1] for item in store.writes], [raw])
+        self.assertEqual(recognized, [pcm_constant(2000, 1600)])
+
     def test_live_controller_records_raw_chunks_before_vad(self) -> None:
         session = FakeSession()
         store = FakeRecordingStore()
@@ -362,6 +716,213 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertGreater(int.from_bytes(signal_chunk[:2], "little", signed=True), 0)
         self.assertEqual(silence_chunk[-200:], bytes(200))
 
+    def test_application_source_reopens_stalled_process_capture(self) -> None:
+        import numpy as np
+
+        signal = np.full((960, 2), 0.5, dtype="<f4").tobytes()
+        opened_sessions: list[int] = []
+        diagnostics: list[tuple[str, dict[str, object]]] = []
+
+        class FakeClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                self.value += 0.011
+                return self.value
+
+        class FakeLoopbackSession:
+            def __init__(self, _process_id: int) -> None:
+                self.index = len(opened_sessions)
+                self.sent_signal = False
+                opened_sessions.append(self.index)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read_packets(self):
+                if self.index == 0 or self.sent_signal:
+                    return iter(())
+                self.sent_signal = True
+                return iter((signal,))
+
+        stop = threading.Event()
+        clock = FakeClock()
+        source = ProcessLoopbackPcmSource(
+            42,
+            AudioCaptureConfig(
+                process_id=42,
+                sample_rate_hertz=16_000,
+                chunk_duration_ms=20,
+            ),
+            refresh_after_silence_seconds=0.03,
+            session_factory=FakeLoopbackSession,
+            monotonic=clock.monotonic,
+            diagnostic_callback=lambda event, payload: diagnostics.append((event, payload)),
+        )
+
+        with patch("mimir.audio.applications.process_exists", return_value=True):
+            chunks = source.chunks(stop)
+            received = [next(chunks) for _ in range(3)]
+            stop.set()
+
+        self.assertGreaterEqual(len(opened_sessions), 2)
+        self.assertTrue(any(any(chunk) for chunk in received))
+        self.assertEqual(diagnostics[0][0], "audio.application_capture.refresh")
+        self.assertEqual(diagnostics[0][1]["refreshCount"], 1)
+
+    def test_application_source_keeps_refreshing_during_long_silence(self) -> None:
+        opened_sessions: list[int] = []
+        diagnostics: list[tuple[str, dict[str, object]]] = []
+
+        class FakeClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                self.value += 0.011
+                return self.value
+
+        class EmptyLoopbackSession:
+            def __init__(self, _process_id: int) -> None:
+                opened_sessions.append(len(opened_sessions))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read_packets(self):
+                return iter(())
+
+        source = ProcessLoopbackPcmSource(
+            42,
+            AudioCaptureConfig(
+                process_id=42,
+                sample_rate_hertz=16_000,
+                chunk_duration_ms=20,
+            ),
+            refresh_after_silence_seconds=0.03,
+            max_consecutive_refreshes=2,
+            session_factory=EmptyLoopbackSession,
+            monotonic=FakeClock().monotonic,
+            diagnostic_callback=lambda event, payload: diagnostics.append((event, payload)),
+        )
+
+        stop = threading.Event()
+        with patch("mimir.audio.applications.process_exists", return_value=True):
+            chunks = source.chunks(stop)
+            for _ in range(20):
+                next(chunks)
+                if len(opened_sessions) >= 4:
+                    break
+            stop.set()
+
+        self.assertGreaterEqual(len(opened_sessions), 4)
+        events = [event for event, _payload in diagnostics]
+        self.assertGreaterEqual(events.count("audio.application_capture.refresh"), 3)
+        self.assertEqual(events.count("audio.application_capture.stalled"), 1)
+        self.assertNotIn("audio.application_capture.failed", events)
+
+    def test_application_source_retries_real_capture_errors(self) -> None:
+        attempts = 0
+        diagnostics: list[str] = []
+        signal = struct.pack("<1920f", *([0.4] * 1920))
+
+        class RecoveringLoopbackSession:
+            def __init__(self, _process_id: int) -> None:
+                nonlocal attempts
+                attempts += 1
+
+            def __enter__(self):
+                if attempts < 3:
+                    raise AudioCaptureError("временная ошибка")
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read_packets(self):
+                return iter((signal,))
+
+        stop = threading.Event()
+        source = ProcessLoopbackPcmSource(
+            42,
+            AudioCaptureConfig(process_id=42, chunk_duration_ms=20),
+            session_factory=RecoveringLoopbackSession,
+            diagnostic_callback=lambda event, _payload: diagnostics.append(event),
+        )
+
+        with patch("mimir.audio.applications.process_exists", return_value=True):
+            chunk = next(source.chunks(stop))
+            stop.set()
+
+        self.assertTrue(any(chunk))
+        self.assertEqual(attempts, 3)
+        self.assertEqual(diagnostics.count("audio.application_capture.retry"), 2)
+
+    def test_application_source_resets_read_errors_after_successful_quiet_reads(self) -> None:
+        opened_sessions: list[int] = []
+        diagnostics: list[str] = []
+        signal = struct.pack("<1920f", *([0.4] * 1920))
+
+        class FakeClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                self.value += 0.011
+                return self.value
+
+        class IntermittentLoopbackSession:
+            def __init__(self, _process_id: int) -> None:
+                self.index = len(opened_sessions)
+                self.sent_signal = False
+                opened_sessions.append(self.index)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read_packets(self):
+                if self.index in {0, 2, 4}:
+                    raise RuntimeError("временная ошибка чтения")
+                if self.index < 5 or self.sent_signal:
+                    return iter(())
+                self.sent_signal = True
+                return iter((signal,))
+
+        stop = threading.Event()
+        source = ProcessLoopbackPcmSource(
+            42,
+            AudioCaptureConfig(process_id=42, chunk_duration_ms=20),
+            refresh_after_silence_seconds=0.03,
+            max_consecutive_refreshes=3,
+            session_factory=IntermittentLoopbackSession,
+            monotonic=FakeClock().monotonic,
+            diagnostic_callback=lambda event, _payload: diagnostics.append(event),
+        )
+
+        with patch("mimir.audio.applications.process_exists", return_value=True):
+            chunks = source.chunks(stop)
+            received = []
+            for _ in range(30):
+                chunk = next(chunks)
+                received.append(chunk)
+                if any(chunk):
+                    break
+            stop.set()
+
+        self.assertTrue(any(any(chunk) for chunk in received))
+        self.assertGreaterEqual(len(opened_sessions), 6)
+        self.assertNotIn("audio.application_capture.failed", diagnostics)
+
     def test_remote_source_uses_selected_application_instead_of_output_device(self) -> None:
         source = default_source_factory(
             "remote",
@@ -468,6 +1029,7 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertTrue(speech.send_to_stt)
         self.assertTrue(tail.send_to_stt)
         self.assertTrue(ended.speech_ended)
+        self.assertEqual(ended.trailing_silence_ms, 250)
         self.assertTrue(ended.send_to_stt)
 
     def test_vad_sends_six_hundred_milliseconds_before_speech(self) -> None:
@@ -558,6 +1120,21 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertIn("Не выдумывай опыт", REALTIME_INSTRUCTIONS)
         self.assertNotIn("на языке вопроса", REALTIME_INSTRUCTIONS)
         self.assertNotIn("пиши по-русски", REALTIME_INSTRUCTIONS)
+
+    def test_realtime_controller_reports_thread_that_is_still_stopping(self) -> None:
+        release = threading.Event()
+        thread = threading.Thread(target=release.wait, daemon=True)
+        thread.start()
+        controller = RealtimeAudioController(FakeSession(), lambda _key: FakeRecognizer())
+        with controller._lock:  # noqa: SLF001 - моделируем зависшее завершение
+            controller._thread = thread  # noqa: SLF001
+            controller._running = False  # noqa: SLF001
+
+        self.assertTrue(controller.has_live_threads())
+
+        release.set()
+        thread.join(timeout=1)
+        self.assertFalse(controller.has_live_threads())
 
     def test_realtime_controller_updates_instructions_after_settings_change(self) -> None:
         class DynamicSession(FakeSession):
@@ -746,7 +1323,47 @@ class AudioPipelineTests(unittest.TestCase):
         self.assertTrue(any(event[:2] == ("audio_chunk", "remote") for event in session.metric_events))
         self.assertIn(("stt", "remote", True), session.metric_events)
         self.assertIn(("stt", "mic", True), session.metric_events)
+        self.assertEqual(session.external_questions[0][2], 1)
         self.assertTrue(any(event == "answer_delta" for event, _payload in session.events))
+
+    def test_realtime_microphone_refinement_keeps_refinement_flag(self) -> None:
+        session = FakeSession()
+
+        class RefiningRecognizer:
+            def stream_lpcm(
+                self,
+                chunks: Iterable[bytes],
+                *,
+                language: str,
+                sample_rate_hertz: int,
+            ) -> Iterator[SpeechRecognitionResult]:
+                del language, sample_rate_hertz
+                if list(chunks):
+                    yield SpeechRecognitionResult(
+                        text="Уточненный итог",
+                        is_final=True,
+                        end_of_utterance=True,
+                        is_refinement=True,
+                    )
+
+        controller = RealtimeAudioController(
+            session,
+            lambda _key: RefiningRecognizer(),
+            source_factory=lambda _source, _config: FakePcmSource([pcm_constant(1000, 3200)]),
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            controller._produce_mic_context(  # noqa: SLF001 - проверяем передачу признака
+                RealtimeAudioConfig(sources=("mic",), vad_enabled=False),
+                threading.Event(),
+                loop,
+                asyncio.Queue(),
+                "test-key",
+            )
+        finally:
+            loop.close()
+
+        self.assertIn(("mic", True, True), session.stt_refinements)
 
     def test_realtime_controller_reconnects_after_receive_error(self) -> None:
         session = FakeSession()

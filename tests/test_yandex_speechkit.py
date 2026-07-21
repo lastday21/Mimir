@@ -91,7 +91,7 @@ class YandexSpeechKitTests(unittest.TestCase):
         self.assertEqual(model.language_restriction.language_code[0], "ru-RU")
         classifier = requests[0].session_options.eou_classifier.default_classifier
         self.assertEqual(classifier.type, stt_pb2.DefaultEouClassifier.DEFAULT)
-        self.assertEqual(classifier.max_pause_between_words_hint_ms, 1_200)
+        self.assertEqual(classifier.max_pause_between_words_hint_ms, 900)
 
     def test_parses_grpc_final_response(self) -> None:
         response = stt_pb2.StreamingResponse(
@@ -189,6 +189,123 @@ class YandexSpeechKitTests(unittest.TestCase):
         self.assertEqual(refinement.text, "25%")
         self.assertTrue(refinement.is_final)
         self.assertTrue(refinement.is_refinement)
+
+    def test_final_cannot_collapse_clear_two_word_partial_into_unrelated_word(self) -> None:
+        assembler = SpeechKitUtteranceAssembler()
+        assembler.accept(
+            stt_pb2.StreamingResponse(
+                partial=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="вас слышат")]
+                )
+            )
+        )
+
+        final_segment = assembler.accept(
+            stt_pb2.StreamingResponse(
+                audio_cursors=stt_pb2.AudioCursors(final_index=0),
+                final=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="наслышаться")]
+                ),
+            )
+        )
+        complete = assembler.accept(
+            stt_pb2.StreamingResponse(eou_update=stt_pb2.EouUpdate(time_ms=1_000))
+        )
+
+        self.assertIsNone(final_segment)
+        self.assertEqual(complete.text, "вас слышат")
+
+    def test_repeated_bad_partials_and_refinement_do_not_erase_clear_phrase(self) -> None:
+        assembler = SpeechKitUtteranceAssembler()
+        assembler.accept(
+            stt_pb2.StreamingResponse(
+                partial=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="вас слышат")]
+                )
+            )
+        )
+        assembler.accept(
+            stt_pb2.StreamingResponse(
+                partial=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="наслышаться")]
+                )
+            )
+        )
+        assembler.accept(
+            stt_pb2.StreamingResponse(
+                partial=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="Наслышаться")]
+                )
+            )
+        )
+        assembler.accept(
+            stt_pb2.StreamingResponse(
+                audio_cursors=stt_pb2.AudioCursors(final_index=0),
+                final=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="Наслышаться")]
+                ),
+            )
+        )
+        complete = assembler.accept(
+            stt_pb2.StreamingResponse(eou_update=stt_pb2.EouUpdate(time_ms=1_000))
+        )
+        refinement = assembler.accept(
+            stt_pb2.StreamingResponse(
+                final_refinement=stt_pb2.FinalRefinement(
+                    final_index=0,
+                    normalized_text=stt_pb2.AlternativeUpdate(
+                        alternatives=[stt_pb2.Alternative(text="наслышаться")]
+                    ),
+                )
+            )
+        )
+
+        self.assertEqual(complete.text, "вас слышат")
+        self.assertEqual(refinement.text, "вас слышат")
+
+    def test_unrelated_final_is_not_replaced_only_because_length_matches(self) -> None:
+        assembler = SpeechKitUtteranceAssembler()
+        assembler.accept(
+            stt_pb2.StreamingResponse(
+                partial=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="я думаю")]
+                )
+            )
+        )
+
+        final_segment = assembler.accept(
+            stt_pb2.StreamingResponse(
+                audio_cursors=stt_pb2.AudioCursors(final_index=0),
+                final=stt_pb2.AlternativeUpdate(
+                    alternatives=[stt_pb2.Alternative(text="идемте")]
+                ),
+            )
+        )
+
+        self.assertEqual(final_segment.text, "идемте")
+
+    def test_similar_valid_final_is_not_replaced_by_partial(self) -> None:
+        for partial, final in (("вам нужно", "возможно"), ("мы можем", "поможем")):
+            with self.subTest(partial=partial, final=final):
+                assembler = SpeechKitUtteranceAssembler()
+                assembler.accept(
+                    stt_pb2.StreamingResponse(
+                        partial=stt_pb2.AlternativeUpdate(
+                            alternatives=[stt_pb2.Alternative(text=partial)]
+                        )
+                    )
+                )
+
+                result = assembler.accept(
+                    stt_pb2.StreamingResponse(
+                        audio_cursors=stt_pb2.AudioCursors(final_index=0),
+                        final=stt_pb2.AlternativeUpdate(
+                            alternatives=[stt_pb2.Alternative(text=final)]
+                        ),
+                    )
+                )
+
+                self.assertEqual(result.text, final)
 
 
 if __name__ == "__main__":

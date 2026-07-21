@@ -58,6 +58,7 @@ class DialogueMemoryTests(unittest.TestCase):
         self.assertEqual(len(memory.turns), 1)
         self.assertTrue(memory.turns[0].is_final)
         self.assertEqual(memory.turns[0].text, "Как вы строили сервис?")
+        self.assertEqual(memory.turns[0].started_at_ms, now[0])
 
     def test_final_refinement_replaces_final_turn_and_linked_user_answer(self) -> None:
         now = [1_000_000]
@@ -77,6 +78,7 @@ class DialogueMemoryTests(unittest.TestCase):
 
         self.assertEqual(refined.operation, "replace")
         self.assertEqual(refined.turn.turn_id, first.turn.turn_id)
+        self.assertEqual(refined.turn.started_at_ms, first.turn.started_at_ms)
         self.assertEqual(len(memory.turns), 1)
         self.assertEqual(exchange["userAnswer"], "Я делал сервис")
 
@@ -114,6 +116,53 @@ class DialogueMemoryTests(unittest.TestCase):
         self.assertIn("Собеседник: Расскажите про Kafka", context)
         self.assertIn("Пользователь: угу", context)
         self.assertIn("Пользователь: Я использовал Kafka", context)
+
+    def test_uncertain_turn_does_not_replace_active_topic(self) -> None:
+        memory = DialogueMemory()
+        memory.append(DialogueTurn(REMOTE_SOURCE, "Какие вертикальные выработки бывают?"))
+        previous_topic = memory.active_topic
+        memory.append(
+            DialogueTurn(
+                REMOTE_SOURCE,
+                "Что такое тогда восстающий вентиляционный",
+            )
+        )
+
+        marked = memory.mark_latest_uncertain(
+            REMOTE_SOURCE,
+            "Что такое тогда восстающий вентиляционный",
+        )
+
+        self.assertIsNotNone(marked)
+        self.assertEqual(memory.active_topic, previous_topic)
+        transcript, through_turn_id, _timestamp_ms = memory.summary_source()
+        self.assertNotIn("восстающий вентиляционный", transcript)
+        self.assertNotEqual(through_turn_id, marked.turn_id)
+
+    def test_marking_uncertain_clears_summary_that_already_covered_the_turn(self) -> None:
+        memory = DialogueMemory()
+        memory.append(DialogueTurn(REMOTE_SOURCE, "Обычный вопрос"))
+        questionable = memory.append(
+            DialogueTurn(
+                REMOTE_SOURCE,
+                "Что такое тогда восстающий вентиляционный",
+            )
+        )
+        later = memory.append(DialogueTurn(MIC_SOURCE, "Поздний ответ пользователя"))
+        self.assertIsNotNone(questionable)
+        self.assertIsNotNone(later)
+        memory.set_summary(
+            "Сводка с сомнительным вопросом",
+            later.turn.turn_id,
+            later.turn.timestamp_ms,
+        )
+
+        memory.mark_latest_uncertain(
+            REMOTE_SOURCE,
+            "Что такое тогда восстающий вентиляционный",
+        )
+
+        self.assertEqual(memory.summary, "")
 
     def test_realtime_context_combines_summary_with_new_final_turns(self) -> None:
         now = [1_000_000]
