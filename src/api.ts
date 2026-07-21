@@ -83,8 +83,10 @@ export interface TranscriptTurn {
   source: "remote" | "mic";
   text: string;
   isFinal: boolean;
+  uncertain?: boolean;
+  startedAtMs: number;
   timestampMs: number;
-  operation?: "append" | "replace" | "remove";
+  operation?: "append" | "replace";
   memoryWindowMs?: number;
 }
 

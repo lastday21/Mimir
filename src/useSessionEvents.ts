@@ -108,6 +108,16 @@ export function useSessionEvents() {
       setStatus(runtimeErrorMessage(payload.error));
     });
 
+    events.addEventListener("stt_warning", (event) => {
+      const payload = parseEvent<{ message: string }>(event);
+      setStatus(payload.message);
+    });
+
+    events.addEventListener("stt_recovered", (event) => {
+      const payload = parseEvent<{ message: string }>(event);
+      setStatus(payload.message);
+    });
+
     events.addEventListener("audio_status", (event) => {
       const payload = parseEvent<{ status: string; source?: string; running?: boolean; mode?: string }>(event);
       if (payload.mode && isAudioMode(payload.mode)) {
@@ -180,9 +190,6 @@ function parseEvent<T>(event: Event): T {
 }
 
 function mergeTranscriptTurn(current: TranscriptTurn[], update: TranscriptTurn): TranscriptTurn[] {
-  if (update.operation === "remove") {
-    return current.filter((turn) => turn.turnId !== update.turnId);
-  }
   const next = [...current];
   const index = next.findIndex((turn) => turn.turnId === update.turnId);
   if (index >= 0) {
@@ -226,6 +233,9 @@ function audioStatusLabel(status: string): string {
     speech: "идёт речь",
     silence: "пауза",
     fallback: "включён запасной способ распознавания",
+    reconnecting: "проверка звука приложения",
+    failed: "ошибка захвата",
+    incomplete: "запись неполная",
     stopping: "остановка",
     stopped: "остановлено",
     done: "завершено",
