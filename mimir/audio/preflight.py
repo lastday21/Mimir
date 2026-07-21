@@ -19,6 +19,9 @@ class PreflightDependencies:
     import_module: Callable[[str], Any]
     audio_is_running: Callable[[], bool]
     list_audio_applications: Callable[[], list[dict[str, Any]]] = lambda: []
+    speechkit_probe: Callable[[str], str] | None = None
+    yandex_model_probe: Callable[[str, str, str], str] | None = None
+    audio_source_probe: Callable[[str, str | None, int], str] | None = None
 
 
 def parse_live_audio_request(
@@ -82,26 +85,7 @@ def build_live_audio_preflight(
         "Live audio is already running" if audio_running else "Live audio is idle",
     )
     if mode == "yandex_realtime":
-        config = dependencies.load_config()
-        folder_ready = bool(config.yandex_folder_id.strip())
-        add_preflight_check(
-            checks,
-            "yandex_folder_id",
-            folder_ready,
-            "Yandex folder is configured" if folder_ready else "Yandex folder ID is missing",
-        )
-        answer_key_ready = bool(
-            dependencies.read_secret("yandex_ai_studio")
-            or dependencies.read_secret("yandex_speechkit")
-        )
-        add_preflight_check(
-            checks,
-            "yandex_ai_studio_key",
-            answer_key_ready,
-            "Yandex AI Studio key is configured"
-            if answer_key_ready
-            else "Yandex AI Studio API key is missing",
-        )
+        add_yandex_answer_checks(checks, dependencies)
         add_import_check(
             checks,
             "aiohttp",
@@ -126,6 +110,14 @@ def build_live_audio_preflight(
         application_process_id=application_process_id,
         list_audio_applications=dependencies.list_audio_applications,
     )
+    if not audio_running:
+        add_audio_source_probe_checks(
+            checks,
+            sources,
+            device_ids,
+            application_process_id,
+            dependencies.audio_source_probe,
+        )
     errors = [str(check["detail"]) for check in checks if not check["ok"]]
     return {
         "ok": not errors,
@@ -140,51 +132,65 @@ def build_live_audio_preflight(
 
 
 def add_speechkit_checks(checks: list[dict[str, Any]], dependencies: PreflightDependencies) -> None:
-    key_ready = bool(
-        dependencies.read_secret("yandex_speechkit")
-        or dependencies.read_secret("yandex_ai_studio")
-    )
+    key = dependencies.read_secret("yandex_speechkit") or dependencies.read_secret("yandex_ai_studio") or ""
+    key_ready = bool(key)
     add_preflight_check(
         checks,
         "yandex_speechkit_key",
         key_ready,
         "Yandex SpeechKit key is configured" if key_ready else "Yandex SpeechKit API key is missing",
     )
-    add_import_check(
+    grpc_ready = add_import_check(
         checks,
         "grpc",
         "grpc",
         "SpeechKit gRPC dependency is missing",
         dependencies.import_module,
     )
-    add_import_check(
+    stubs_ready = add_import_check(
         checks,
         "yandexcloud_stt",
         "yandex.cloud.ai.stt.v3.stt_service_pb2_grpc",
         "SpeechKit stubs are missing",
         dependencies.import_module,
     )
+    probe = dependencies.speechkit_probe
+    if key_ready and grpc_ready and stubs_ready and probe is not None:
+        add_runtime_probe_check(
+            checks,
+            "speechkit_connection",
+            lambda: probe(key),
+            "Соединение со SpeechKit установлено",
+        )
 
 
 def add_yandex_answer_checks(checks: list[dict[str, Any]], dependencies: PreflightDependencies) -> None:
     config = dependencies.load_config()
-    folder_ready = bool(config.yandex_folder_id.strip())
+    folder_id = str(config.yandex_folder_id).strip()
+    folder_ready = bool(folder_id)
     add_preflight_check(
         checks,
         "yandex_folder_id",
         folder_ready,
         "Yandex folder is configured" if folder_ready else "Yandex folder ID is missing",
     )
-    key_ready = bool(
-        dependencies.read_secret("yandex_ai_studio")
-        or dependencies.read_secret("yandex_speechkit")
-    )
+    key = dependencies.read_secret("yandex_ai_studio") or dependencies.read_secret("yandex_speechkit") or ""
+    key_ready = bool(key)
     add_preflight_check(
         checks,
         "yandex_ai_studio_key",
         key_ready,
         "Yandex AI Studio key is configured" if key_ready else "Yandex AI Studio API key is missing",
     )
+    probe = dependencies.yandex_model_probe
+    if folder_ready and key_ready and probe is not None:
+        model = str(getattr(config, "llm_model", "")).strip()
+        add_runtime_probe_check(
+            checks,
+            "yandex_model_connection",
+            lambda: probe(key, folder_id, model),
+            "Соединение с моделью установлено",
+        )
 
 
 def add_local_stt_checks(checks: list[dict[str, Any]], dependencies: PreflightDependencies) -> None:
@@ -289,19 +295,65 @@ def add_device_checks(
             add_preflight_check(checks, f"{source}_device", bool(source_devices), detail)
 
 
+def add_audio_source_probe_checks(
+    checks: list[dict[str, Any]],
+    sources: list[str],
+    device_ids: dict[str, str],
+    application_process_id: int,
+    probe: Callable[[str, str | None, int], str] | None,
+) -> None:
+    if probe is None:
+        return
+    for source in sources:
+        prerequisite = "remote_application" if source == "remote" else f"{source}_device"
+        if not check_passed(checks, prerequisite):
+            continue
+        label = "программы созвона" if source == "remote" else "микрофона"
+        add_runtime_probe_check(
+            checks,
+            f"{source}_capture",
+            lambda source=source: probe(
+                source,
+                device_ids.get(source) or None,
+                application_process_id,
+            ),
+            f"Захват {label} открывается",
+        )
+
+
+def check_passed(checks: list[dict[str, Any]], name: str) -> bool:
+    return any(check.get("name") == name and check.get("ok") is True for check in checks)
+
+
+def add_runtime_probe_check(
+    checks: list[dict[str, Any]],
+    name: str,
+    probe: Callable[[], str],
+    success_detail: str,
+) -> None:
+    try:
+        detail = probe().strip() or success_detail
+    except Exception as error:
+        detail = str(error).strip() or error.__class__.__name__
+        add_preflight_check(checks, name, False, detail)
+        return
+    add_preflight_check(checks, name, True, detail)
+
+
 def add_import_check(
     checks: list[dict[str, Any]],
     name: str,
     module: str,
     error: str,
     import_module: Callable[[str], Any],
-) -> None:
+) -> bool:
     try:
         import_module(module)
     except ImportError:
         add_preflight_check(checks, name, False, error)
-        return
+        return False
     add_preflight_check(checks, name, True, "available")
+    return True
 
 
 def add_preflight_check(checks: list[dict[str, Any]], name: str, ok: bool, detail: str) -> None:

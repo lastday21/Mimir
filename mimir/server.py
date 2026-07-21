@@ -52,6 +52,11 @@ from .models import ModelInfo
 from .ollama_fallback import select_preferred_model, sort_models
 from .providers import OllamaClient, YandexAIStudioClient, YandexSpeechKitClient
 from .providers.base import ProviderError
+from .preflight_probes import (
+    probe_audio_source,
+    probe_speechkit_connection,
+    probe_yandex_model,
+)
 from .session import SessionEvent, SessionManager, sse_payload
 from .stt import AudioStreamConfig, SpeechKitStreamRunner, pcm_chunks_from_wav
 from .stt.local_vosk import LocalVoskRecognizer, local_vosk_status
@@ -562,6 +567,9 @@ def preflight_dependencies() -> PreflightDependencies:
         select_preferred_model=select_preferred_model,
         import_module=import_module,
         audio_is_running=audio_is_running,
+        speechkit_probe=probe_speechkit_connection,
+        yandex_model_probe=probe_yandex_model,
+        audio_source_probe=probe_audio_source,
     )
 
 
@@ -604,8 +612,8 @@ def add_device_checks(
     )
 
 
-def add_import_check(checks: list[dict[str, Any]], name: str, module: str, error: str) -> None:
-    add_audio_import_check(checks, name, module, error, import_module)
+def add_import_check(checks: list[dict[str, Any]], name: str, module: str, error: str) -> bool:
+    return add_audio_import_check(checks, name, module, error, import_module)
 
 
 def add_preflight_check(checks: list[dict[str, Any]], name: str, ok: bool, detail: str) -> None:
@@ -667,7 +675,7 @@ def toggle_live_audio() -> dict[str, object]:
             preflight = build_live_audio_preflight(request)
             if not preflight["ok"]:
                 errors = preflight.get("errors") or ["Live audio preflight failed"]
-                raise ProviderError(str(errors[0]))
+                raise ProviderError("; ".join(str(error) for error in errors))
             return start_live_audio_locked(request)
         except Exception as error:
             SESSION_MANAGER.publish_status(
@@ -771,7 +779,10 @@ def serve(host: str = HOST, port: int = PORT) -> None:
     try:
         server.serve_forever()
     finally:
-        server.server_close()
+        try:
+            stop_live_session()
+        finally:
+            server.server_close()
 
 
 def main() -> None:

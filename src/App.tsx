@@ -84,6 +84,7 @@ export function App() {
   const [liveRemote, setLiveRemote] = useState(true);
   const [liveMic, setLiveMic] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [preflightErrors, setPreflightErrors] = useState<string[]>([]);
   const messengerRef = useRef<HTMLDivElement>(null);
   const {
     answer,
@@ -288,6 +289,7 @@ export function App() {
     if (liveMic) sources.push("mic");
     if (sources.length === 0) return;
     setBusy(true);
+    setPreflightErrors([]);
     try {
       setAudioLevels(emptyAudioLevels());
       const deviceIds = recommendedDeviceIds(audioDevices, sources.filter((source) => source === "mic"));
@@ -299,7 +301,9 @@ export function App() {
         applicationProcessId
       );
       if (!preflight.ok) {
-        setStatus(preflight.errors[0] || "Проверка звука не прошла");
+        const errors = preflight.errors.length > 0 ? preflight.errors : ["Проверка звука не прошла"];
+        setPreflightErrors(errors);
+        setStatus(`Проверка готовности не пройдена: ${errors.length}`);
         return;
       }
       const snapshot = await startLiveAudio(
@@ -317,7 +321,9 @@ export function App() {
         `Звук включён: ${audioModeLabel(runningMode)} · ${snapshot.sources.map(audioSourceLabel).join(" + ")}`
       );
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Не удалось запустить звук");
+      const message = error instanceof Error ? error.message : "Не удалось запустить звук";
+      setPreflightErrors([message]);
+      setStatus(message);
     } finally {
       setBusy(false);
     }
@@ -373,6 +379,7 @@ export function App() {
           <span>{status}</span>
           {busy && <Loader2 className="spin" size={14} />}
         </header>
+        <PreflightErrorList compact errors={preflightErrors} />
 
         <section className="overlay-question">
           <small>Вопрос</small>
@@ -424,6 +431,7 @@ export function App() {
           {audioRunning ? "Пауза" : "Включить"}
         </button>
       </section>
+      <PreflightErrorList errors={preflightErrors} />
 
       <section className="live-layout">
         <section className="panel answer-panel">
@@ -472,6 +480,18 @@ function StatusItem({ active, label, value }: { active: boolean; label: string; 
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+function PreflightErrorList({ errors, compact = false }: { errors: string[]; compact?: boolean }) {
+  if (errors.length === 0) return null;
+  return (
+    <section className={`preflight-errors ${compact ? "compact" : ""}`} role="alert">
+      <strong>Перед запуском исправьте:</strong>
+      <ul>
+        {errors.map((error, index) => <li key={`${index}:${error}`}>{error}</li>)}
+      </ul>
+    </section>
   );
 }
 

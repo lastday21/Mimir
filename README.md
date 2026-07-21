@@ -29,6 +29,10 @@ the settings screen and take effect after restarting the desktop window. The
 audio hotkey uses the mode selected in settings and shares the same audio control
 path as the main window and overlay.
 
+The desktop launcher keeps one Mimir instance per Windows session. Closing the
+desktop window stops active capture, SpeechKit requests, replay, and the current
+session before the local server exits.
+
 ## Realtime Session Core
 
 The main path is whole-utterance SpeechKit recognition followed by automatic answer streaming.
@@ -41,6 +45,7 @@ The backend exposes a session API:
 - `GET /api/audio/applications`
 - `POST /api/session/audio/start`
 - `POST /api/session/audio/stop`
+- `POST /api/session/audio/preflight`
 - `POST /api/session/transcript`
 - `POST /api/session/stt/wav`
 
@@ -64,6 +69,11 @@ question into several answer attempts.
 
 If the cloud path fails, Mimir switches to `local_vosk` and Ollama with the same
 audio sources.
+
+Before live capture starts, the preflight endpoint checks the selected process
+and microphone by opening each source briefly. Cloud mode also verifies the
+configured Yandex model and SpeechKit connection. Every failed check is returned
+to the client and shown together instead of hiding failures after the first one.
 
 `/api/session/transcript` remains a development input for direct transcript
 injection.

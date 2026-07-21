@@ -33,8 +33,13 @@ class YandexAIStudioClient:
             "OpenAI-Project": self.folder_id,
         }
 
-    def list_models(self) -> list[ModelInfo]:
-        data = request_json("GET", f"{self.base_url}/models", headers=self._headers(), timeout=30)
+    def list_models(self, *, timeout_seconds: int = 30) -> list[ModelInfo]:
+        data = request_json(
+            "GET",
+            f"{self.base_url}/models",
+            headers=self._headers(),
+            timeout=timeout_seconds,
+        )
         raw_models = data.get("data", [])
         if not isinstance(raw_models, list):
             return []

@@ -679,6 +679,35 @@ button:disabled {
   color: #9dc8ff;
 }
 
+.preflight-errors {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  border-radius: 12px;
+  background: rgba(127, 29, 29, 0.22);
+  color: #fecaca;
+}
+
+.preflight-errors strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.preflight-errors ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.preflight-errors li + li {
+  margin-top: 4px;
+}
+
+.preflight-errors.compact {
+  margin: 8px 12px 0;
+  padding: 9px 11px;
+  font-size: 12px;
+}
+
 .listen-toggle {
   min-width: 128px;
 }

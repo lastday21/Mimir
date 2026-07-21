@@ -60,6 +60,7 @@ class YandexSpeechKitClient:
         *,
         language: str = DEFAULT_LANGUAGE,
         sample_rate_hertz: int = DEFAULT_SAMPLE_RATE,
+        timeout_seconds: int = 45,
     ) -> str:
         if not self.api_key:
             raise ProviderError("Yandex SpeechKit API key is not configured")
@@ -90,13 +91,17 @@ class YandexSpeechKitClient:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
             raise ProviderError(f"Yandex SpeechKit returned HTTP {error.code}: {detail}") from error
         except urllib.error.URLError as error:
             raise ProviderError(f"Yandex SpeechKit is not reachable: {error.reason}") from error
+        except TimeoutError as error:
+            raise ProviderError("Yandex SpeechKit request timed out") from error
+        except OSError as error:
+            raise ProviderError(f"Yandex SpeechKit request failed: {error}") from error
 
         try:
             payload = json.loads(raw)

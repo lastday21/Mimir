@@ -618,6 +618,8 @@ class ServerSpeechKitWavTests(unittest.TestCase):
         original_read_secret = server.read_secret
         original_load_config = server.load_config
         original_list_audio_devices = server.list_audio_devices
+        original_speechkit_probe = server.probe_speechkit_connection
+        original_audio_probe = server.probe_audio_source
 
         class FakeAudio:
             def snapshot(self) -> dict[str, object]:
@@ -634,6 +636,8 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             {"id": "remote1", "source": "remote"},
             {"id": "mic1", "source": "mic"},
         ]
+        server.probe_speechkit_connection = lambda _key: "SpeechKit доступен"
+        server.probe_audio_source = lambda *_args: "Захват доступен"
         httpd = server.create_server(port=0)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -667,6 +671,8 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             server.read_secret = original_read_secret
             server.load_config = original_load_config
             server.list_audio_devices = original_list_audio_devices
+            server.probe_speechkit_connection = original_speechkit_probe
+            server.probe_audio_source = original_audio_probe
 
     def test_realtime_audio_preflight_passes_ready_setup(self) -> None:
         original_live_audio = server.LIVE_AUDIO
@@ -675,6 +681,9 @@ class ServerSpeechKitWavTests(unittest.TestCase):
         original_load_config = server.load_config
         original_list_audio_devices = server.list_audio_devices
         original_list_audio_applications = server.list_audio_applications
+        original_speechkit_probe = server.probe_speechkit_connection
+        original_model_probe = server.probe_yandex_model
+        original_audio_probe = server.probe_audio_source
 
         class FakeAudio:
             def snapshot(self) -> dict[str, object]:
@@ -682,6 +691,7 @@ class ServerSpeechKitWavTests(unittest.TestCase):
 
         class FakeConfig:
             yandex_folder_id = "folder-id"
+            llm_model = "yandexgpt/latest"
 
         server.LIVE_AUDIO = FakeAudio()
         server.REALTIME_AUDIO = FakeAudio()
@@ -694,6 +704,9 @@ class ServerSpeechKitWavTests(unittest.TestCase):
         server.list_audio_applications = lambda: [
             {"processId": 42, "executable": "meeting.exe", "title": "Рабочий созвон"},
         ]
+        server.probe_speechkit_connection = lambda _key: "SpeechKit доступен"
+        server.probe_yandex_model = lambda *_args: "Модель доступна"
+        server.probe_audio_source = lambda *_args: "Захват доступен"
         httpd = server.create_server(port=0)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -735,6 +748,9 @@ class ServerSpeechKitWavTests(unittest.TestCase):
             server.load_config = original_load_config
             server.list_audio_devices = original_list_audio_devices
             server.list_audio_applications = original_list_audio_applications
+            server.probe_speechkit_connection = original_speechkit_probe
+            server.probe_yandex_model = original_model_probe
+            server.probe_audio_source = original_audio_probe
 
 
 if __name__ == "__main__":
