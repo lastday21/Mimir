@@ -5,7 +5,7 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -215,9 +215,39 @@ class AudioApplication:
 
 
 class ProcessLoopbackPcmSource:
-    def __init__(self, process_id: int, config: AudioCaptureConfig | None = None) -> None:
+    def __init__(
+        self,
+        process_id: int,
+        config: AudioCaptureConfig | None = None,
+        *,
+        refresh_after_silence_seconds: float = 10.0,
+        max_consecutive_refreshes: int = 3,
+        session_factory: Callable[[int], Any] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        diagnostic_callback: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> None:
+        if refresh_after_silence_seconds <= 0:
+            raise ValueError("capture refresh timeout must be positive")
+        if max_consecutive_refreshes <= 0:
+            raise ValueError("maximum capture refresh count must be positive")
         self.process_id = int(process_id)
         self.config = config or AudioCaptureConfig()
+        self.refresh_after_silence_seconds = float(refresh_after_silence_seconds)
+        self.max_consecutive_refreshes = int(max_consecutive_refreshes)
+        self._session_factory = session_factory
+        self._monotonic = monotonic or time.monotonic
+        self._diagnostic_callback = diagnostic_callback
+
+    def set_diagnostic_callback(
+        self,
+        callback: Callable[[str, dict[str, object]], None] | None,
+    ) -> None:
+        self._diagnostic_callback = callback
+
+    def _diagnostic(self, event: str, **payload: object) -> None:
+        callback = self._diagnostic_callback
+        if callback is not None:
+            callback(event, payload)
 
     def chunks(self, stop_event: threading.Event) -> Iterator[bytes]:
         if os.name != "nt":
@@ -233,27 +263,105 @@ class ProcessLoopbackPcmSource:
         )
         silence_interval = self.config.chunk_duration_ms / 1_000
         source_silence = bytes(round(48_000 * silence_interval) * 8)
-        next_silence_at = time.monotonic() + silence_interval
-        with _ProcessLoopbackSession(self.process_id) as session:
-            last_process_check = time.monotonic()
-            while not stop_event.is_set():
-                received = False
-                for packet in session.read_packets():
-                    received = True
-                    for chunk in converter.feed(packet):
-                        yield chunk
-                    next_silence_at = time.monotonic() + silence_interval
+        now = self._monotonic()
+        next_silence_at = now + silence_interval
+        session_factory = self._session_factory or _ProcessLoopbackSession
+        refresh_count = 0
+        consecutive_refreshes = 0
+        consecutive_open_errors = 0
+        consecutive_read_errors = 0
+        while not stop_event.is_set():
+            should_refresh = False
+            opened_successfully = False
+            try:
+                with session_factory(self.process_id) as session:
+                    opened_successfully = True
+                    consecutive_open_errors = 0
+                    opened_at = self._monotonic()
+                    no_packets_since = opened_at
+                    last_process_check = opened_at
+                    while not stop_event.is_set():
+                        received = False
+                        for packet in session.read_packets():
+                            received = True
+                            for chunk in converter.feed(packet):
+                                yield chunk
+                        consecutive_read_errors = 0
 
-                now = time.monotonic()
-                if not received and now >= next_silence_at:
-                    yield from converter.feed(source_silence)
-                    next_silence_at = now + silence_interval
-                if now - last_process_check >= 1.0:
-                    if not process_exists(self.process_id):
-                        raise AudioCaptureError("Выбранное приложение созвона было закрыто")
-                    last_process_check = now
-                if not received:
-                    stop_event.wait(0.01)
+                        now = self._monotonic()
+                        if received:
+                            no_packets_since = now
+                            next_silence_at = now + silence_interval
+                            consecutive_refreshes = 0
+
+                        if now - last_process_check >= 1.0:
+                            if not process_exists(self.process_id):
+                                raise AudioCaptureError("Выбранное приложение созвона было закрыто")
+                            last_process_check = now
+
+                        if not received and now >= next_silence_at:
+                            yield from converter.feed(source_silence)
+                            next_silence_at += silence_interval
+
+                        silent_for = now - no_packets_since
+                        if not received and silent_for >= self.refresh_after_silence_seconds:
+                            if not process_exists(self.process_id):
+                                raise AudioCaptureError("Выбранное приложение созвона было закрыто")
+                            refresh_count += 1
+                            consecutive_refreshes += 1
+                            self._diagnostic(
+                                "audio.application_capture.refresh",
+                                processId=self.process_id,
+                                silentForMs=round(silent_for * 1000),
+                                refreshCount=refresh_count,
+                            )
+                            if consecutive_refreshes == self.max_consecutive_refreshes:
+                                self._diagnostic(
+                                    "audio.application_capture.stalled",
+                                    processId=self.process_id,
+                                    silentForMs=round(silent_for * 1000),
+                                    refreshCount=refresh_count,
+                                )
+                            should_refresh = True
+                            break
+                        if not received:
+                            stop_event.wait(0.01)
+            except Exception as error:
+                if stop_event.is_set():
+                    return
+                if not process_exists(self.process_id):
+                    raise AudioCaptureError("Выбранное приложение созвона было закрыто") from error
+                if opened_successfully:
+                    consecutive_read_errors += 1
+                    consecutive_errors = consecutive_read_errors
+                    error_kind = "read"
+                else:
+                    consecutive_open_errors += 1
+                    consecutive_errors = consecutive_open_errors
+                    error_kind = "open"
+                refresh_count += 1
+                self._diagnostic(
+                    "audio.application_capture.retry",
+                    processId=self.process_id,
+                    refreshCount=refresh_count,
+                    errorKind=error_kind,
+                    error=str(error) or error.__class__.__name__,
+                )
+                if consecutive_errors >= self.max_consecutive_refreshes:
+                    self._diagnostic(
+                        "audio.application_capture.failed",
+                        processId=self.process_id,
+                        refreshCount=refresh_count,
+                        errorKind=error_kind,
+                        error=str(error) or error.__class__.__name__,
+                    )
+                    if isinstance(error, AudioCaptureError):
+                        raise
+                    raise AudioCaptureError("Не удалось открыть звук выбранного приложения") from error
+                stop_event.wait(0.1)
+                continue
+            if not should_refresh:
+                return
 
 
 class _FloatStereoConverter:

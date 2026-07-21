@@ -11,7 +11,7 @@ import wave
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 REMOTE_SOURCE = "remote"
@@ -53,8 +53,14 @@ class _ActiveRecording:
     manifest: dict[str, Any]
     started_monotonic_ns: int
     writers: dict[str, wave.Wave_write]
+    events_handle: TextIO
     frames: dict[str, int]
     received_audio: dict[str, bool]
+    non_silent_frames: dict[str, int]
+    last_non_silent_frame: dict[str, int]
+    inserted_gap_frames: dict[str, int]
+    stream_dropped_frames: dict[str, int]
+    capture_dropped_frames: dict[str, int]
     write_failed: bool = False
 
 
@@ -99,6 +105,7 @@ class CallRecordingStore:
             descriptor.directory.mkdir(parents=True)
             (descriptor.directory / "audio").mkdir()
             writers: dict[str, wave.Wave_write] = {}
+            events_handle: TextIO | None = None
             try:
                 for source in SOURCES:
                     writer = wave.open(str(descriptor.track_path(source)), "wb")
@@ -106,14 +113,21 @@ class CallRecordingStore:
                     writer.setsampwidth(SAMPLE_WIDTH_BYTES)
                     writer.setframerate(self.sample_rate_hertz)
                     writers[source] = writer
+                events_handle = descriptor.events_path.open("x", encoding="utf-8", buffering=64 * 1024)
             except Exception:
                 for writer in writers.values():
                     try:
                         writer.close()
                     except Exception:
                         pass
+                if events_handle is not None:
+                    try:
+                        events_handle.close()
+                    except Exception:
+                        pass
                 shutil.rmtree(descriptor.directory, ignore_errors=True)
                 raise
+            assert events_handle is not None
 
             now_ms = int(time.time() * 1000) if created_at_ms is None else int(created_at_ms)
             manifest: dict[str, Any] = {
@@ -136,6 +150,17 @@ class CallRecordingStore:
                         "path": f"audio/{source}.wav",
                         "frames": 0,
                         "receivedAudio": False,
+                        "nonSilentFrames": 0,
+                        "lastNonSilentAtMs": None,
+                        "silentTailMs": 0,
+                        "insertedGapFrames": 0,
+                        "insertedGapMs": 0,
+                        "streamDroppedFrames": 0,
+                        "streamDroppedAudioMs": 0,
+                        "captureDroppedFrames": 0,
+                        "captureDroppedAudioMs": 0,
+                        "tailPaddingFrames": 0,
+                        "tailPaddingMs": 0,
                         "sizeBytes": 0,
                         "sha256": "",
                     }
@@ -150,18 +175,33 @@ class CallRecordingStore:
                     time.monotonic_ns() if started_monotonic_ns is None else int(started_monotonic_ns)
                 ),
                 writers=writers,
+                events_handle=events_handle,
                 frames={source: 0 for source in SOURCES},
                 received_audio={source: False for source in SOURCES},
+                non_silent_frames={source: 0 for source in SOURCES},
+                last_non_silent_frame={source: 0 for source in SOURCES},
+                inserted_gap_frames={source: 0 for source in SOURCES},
+                stream_dropped_frames={source: 0 for source in SOURCES},
+                capture_dropped_frames={source: 0 for source in SOURCES},
             )
             self._write_manifest(descriptor, manifest)
             self._append_event_locked("recording.started", recordingId=clean_id)
             return self._descriptor(manifest, descriptor)
 
-    def write(self, source: str, pcm: bytes, *, captured_at_ns: int | None = None) -> bool:
+    def write(
+        self,
+        source: str,
+        pcm: bytes,
+        *,
+        captured_at_ns: int | None = None,
+        recording_id: str = "",
+    ) -> bool:
         try:
             with self._lock:
                 active = self._active
                 if active is None:
+                    return False
+                if recording_id and active.descriptor.recording_id != recording_id:
                     return False
                 try:
                     clean_source = normalize_source(source)
@@ -171,17 +211,63 @@ class CallRecordingStore:
 
                     sample_count = len(raw) // SAMPLE_WIDTH_BYTES
                     observed_at_ns = time.monotonic_ns() if captured_at_ns is None else int(captured_at_ns)
+                    elapsed_ns = max(0, observed_at_ns - active.started_monotonic_ns)
+                    elapsed_frames = round(elapsed_ns * self.sample_rate_hertz / 1_000_000_000)
+                    expected_start_frame = max(0, elapsed_frames - sample_count)
                     if not active.received_audio[clean_source]:
-                        elapsed_ns = max(0, observed_at_ns - active.started_monotonic_ns)
-                        elapsed_frames = round(elapsed_ns * self.sample_rate_hertz / 1_000_000_000)
-                        leading_frames = max(0, elapsed_frames - sample_count)
+                        leading_frames = expected_start_frame
                         self._write_silence(active, clean_source, leading_frames)
                         active.received_audio[clean_source] = True
                         active.manifest["tracks"][clean_source]["receivedAudio"] = True
+                    else:
+                        gap_frames = expected_start_frame - active.frames[clean_source]
+                        tolerance_frames = max(
+                            1,
+                            round(self.sample_rate_hertz * min(50, self.chunk_duration_ms / 4) / 1000),
+                        )
+                        if gap_frames > tolerance_frames:
+                            gap_offset = active.frames[clean_source]
+                            self._write_silence(active, clean_source, gap_frames)
+                            active.inserted_gap_frames[clean_source] += gap_frames
+                            active.manifest["tracks"][clean_source]["insertedGapFrames"] = (
+                                active.inserted_gap_frames[clean_source]
+                            )
+                            active.manifest["tracks"][clean_source]["insertedGapMs"] = round(
+                                active.inserted_gap_frames[clean_source]
+                                * 1000
+                                / self.sample_rate_hertz
+                            )
+                            self._append_event_locked(
+                                "audio.gap",
+                                source=clean_source,
+                                offsetFrames=gap_offset,
+                                frames=gap_frames,
+                                gapMs=round(gap_frames * 1000 / self.sample_rate_hertz),
+                                elapsedMs=round(elapsed_ns / 1_000_000),
+                            )
 
                     offset_frames = active.frames[clean_source]
                     active.writers[clean_source].writeframesraw(raw)
                     active.frames[clean_source] += sample_count
+                    non_silent_count = 0
+                    last_non_silent_index = -1
+                    for index in range(sample_count):
+                        byte_offset = index * SAMPLE_WIDTH_BYTES
+                        if raw[byte_offset] or raw[byte_offset + 1]:
+                            non_silent_count += 1
+                            last_non_silent_index = index
+                    if non_silent_count:
+                        active.non_silent_frames[clean_source] += non_silent_count
+                        active.last_non_silent_frame[clean_source] = (
+                            offset_frames + last_non_silent_index + 1
+                        )
+                        track = active.manifest["tracks"][clean_source]
+                        track["nonSilentFrames"] = active.non_silent_frames[clean_source]
+                        track["lastNonSilentAtMs"] = round(
+                            active.last_non_silent_frame[clean_source]
+                            * 1000
+                            / self.sample_rate_hertz
+                        )
                     self._append_event_locked(
                         "audio.chunk",
                         source=clean_source,
@@ -205,6 +291,90 @@ class CallRecordingStore:
         except Exception:
             return False
 
+    def record_stream_drop(
+        self,
+        source: str,
+        frames: int,
+        *,
+        captured_at_ns: int | None = None,
+    ) -> bool:
+        """Record audio discarded before recognition because its live queue overflowed."""
+        try:
+            with self._lock:
+                active = self._active
+                if active is None:
+                    return False
+                clean_source = normalize_source(source)
+                dropped_frames = max(0, int(frames))
+                if dropped_frames <= 0:
+                    return False
+                active.stream_dropped_frames[clean_source] += dropped_frames
+                total_frames = active.stream_dropped_frames[clean_source]
+                track = active.manifest["tracks"][clean_source]
+                track["streamDroppedFrames"] = total_frames
+                track["streamDroppedAudioMs"] = round(
+                    total_frames * 1000 / self.sample_rate_hertz
+                )
+                active.manifest["hasRecognitionAudioLoss"] = True
+                observed_at_ns = (
+                    time.monotonic_ns() if captured_at_ns is None else int(captured_at_ns)
+                )
+                return self._append_event_locked(
+                    "audio.stream_drop",
+                    source=clean_source,
+                    frames=dropped_frames,
+                    droppedAudioMs=round(dropped_frames * 1000 / self.sample_rate_hertz),
+                    totalDroppedFrames=total_frames,
+                    elapsedMs=max(
+                        0,
+                        round((observed_at_ns - active.started_monotonic_ns) / 1_000_000),
+                    ),
+                )
+        except Exception:
+            return False
+
+    def record_capture_drop(
+        self,
+        source: str,
+        frames: int,
+        *,
+        captured_at_ns: int | None = None,
+    ) -> bool:
+        """Record raw audio lost because the recording queue overflowed."""
+        try:
+            with self._lock:
+                active = self._active
+                if active is None:
+                    return False
+                clean_source = normalize_source(source)
+                dropped_frames = max(0, int(frames))
+                if dropped_frames <= 0:
+                    return False
+                active.capture_dropped_frames[clean_source] += dropped_frames
+                total_frames = active.capture_dropped_frames[clean_source]
+                track = active.manifest["tracks"][clean_source]
+                track["captureDroppedFrames"] = total_frames
+                track["captureDroppedAudioMs"] = round(
+                    total_frames * 1000 / self.sample_rate_hertz
+                )
+                active.manifest["hasCaptureAudioLoss"] = True
+                observed_at_ns = (
+                    time.monotonic_ns() if captured_at_ns is None else int(captured_at_ns)
+                )
+                return self._append_event_locked(
+                    "audio.capture_drop",
+                    source=clean_source,
+                    frames=dropped_frames,
+                    droppedAudioMs=round(dropped_frames * 1000 / self.sample_rate_hertz),
+                    totalDroppedFrames=total_frames,
+                    elapsedMs=max(
+                        0,
+                        round((observed_at_ns - active.started_monotonic_ns) / 1_000_000),
+                    ),
+                )
+        except Exception:
+            return False
+
     def record_event(self, event: str, **payload: Any) -> bool:
         try:
             with self._lock:
@@ -214,17 +384,32 @@ class CallRecordingStore:
         except Exception:
             return False
 
-    def finish(self, *, error: str = "") -> dict[str, Any]:
+    def finish(
+        self,
+        *,
+        error: str = "",
+        finished_monotonic_ns: int | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             active = self._active
             if active is None:
                 raise CallRecordingError("no call recording is active")
 
-            target_frames = max(active.frames.values(), default=0)
+            audio_frames = max(active.frames.values(), default=0)
+            wall_frames = audio_frames
+            if finished_monotonic_ns is not None:
+                elapsed_ns = max(0, int(finished_monotonic_ns) - active.started_monotonic_ns)
+                wall_frames = round(elapsed_ns * self.sample_rate_hertz / 1_000_000_000)
+            target_frames = max(audio_frames, wall_frames)
             errors: list[str] = []
             for source in SOURCES:
                 try:
-                    self._write_silence(active, source, target_frames - active.frames[source])
+                    tail_padding_frames = max(0, target_frames - active.frames[source])
+                    active.manifest["tracks"][source]["tailPaddingFrames"] = tail_padding_frames
+                    active.manifest["tracks"][source]["tailPaddingMs"] = round(
+                        tail_padding_frames * 1000 / self.sample_rate_hertz
+                    )
+                    self._write_silence(active, source, tail_padding_frames)
                 except Exception as error:
                     active.write_failed = True
                     errors.append(f"{source}: {error}")
@@ -236,15 +421,43 @@ class CallRecordingStore:
 
             finished_at_ms = int(time.time() * 1000)
             received_sources = sum(1 for received in active.received_audio.values() if received)
+            has_timeline_gaps = any(active.inserted_gap_frames.values())
+            has_stream_drops = any(active.stream_dropped_frames.values())
+            has_capture_drops = any(active.capture_dropped_frames.values())
+            missing_non_silent_audio = any(
+                active.received_audio[source] and not active.non_silent_frames[source]
+                for source in SOURCES
+            )
+            for source in SOURCES:
+                silent_tail_frames = max(
+                    0,
+                    target_frames - active.last_non_silent_frame[source],
+                )
+                silent_tail_ms = round(silent_tail_frames * 1000 / self.sample_rate_hertz)
+                active.manifest["tracks"][source]["silentTailMs"] = silent_tail_ms
+            excessive_tail_padding = any(
+                int(active.manifest["tracks"][source]["tailPaddingFrames"])
+                > self.sample_rate_hertz
+                for source in SOURCES
+            )
             if active.write_failed:
                 status = "failed"
-            elif error or received_sources < len(SOURCES):
+            elif (
+                error
+                or received_sources < len(SOURCES)
+                or has_timeline_gaps
+                or has_stream_drops
+                or has_capture_drops
+                or missing_non_silent_audio
+                or excessive_tail_padding
+            ):
                 status = "incomplete"
             else:
                 status = "complete"
             active.manifest["status"] = status
             active.manifest["finishedAtMs"] = finished_at_ms
             active.manifest["durationMs"] = round(target_frames * 1000 / self.sample_rate_hertz)
+            active.manifest["wallDurationMs"] = round(wall_frames * 1000 / self.sample_rate_hertz)
             if error:
                 errors.append(clean_text(error))
             if errors:
@@ -269,6 +482,13 @@ class CallRecordingStore:
                 durationMs=active.manifest["durationMs"],
                 sizeBytes=total_size,
             )
+            try:
+                active.events_handle.flush()
+                active.events_handle.close()
+            except Exception as events_error:
+                active.write_failed = True
+                active.manifest["status"] = "failed"
+                active.manifest.setdefault("errors", []).append(f"events close: {events_error}")
             self._write_manifest(active.descriptor, active.manifest)
             result = self._descriptor(active.manifest, active.descriptor)
             self._active = None
@@ -422,10 +642,10 @@ class CallRecordingStore:
             **sanitize(payload),
         }
         try:
-            active.descriptor.events_path.parent.mkdir(parents=True, exist_ok=True)
-            with active.descriptor.events_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
-                handle.write("\n")
+            active.events_handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+            active.events_handle.write("\n")
+            if event != "audio.chunk":
+                active.events_handle.flush()
             return True
         except Exception:
             return False

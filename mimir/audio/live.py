@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import math
+import os
+import queue
+import sys
 import threading
 import time
+from array import array
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
+from .. import __version__
 from ..dialogue import MIC_SOURCE, REMOTE_SOURCE
 from ..live_trace import trace_live_event, trace_path_payload
 from ..providers.base import ProviderError
 from ..stt import AudioStreamConfig, SpeechKitStreamRunner, StreamingRecognizer
-from .capture import AudioCaptureConfig, AudioCaptureError, SoundcardPcmSource
 from .applications import ProcessLoopbackPcmSource
+from .capture import AudioCaptureConfig, AudioCaptureError, SoundcardPcmSource
 from .vad import EnergyVadConfig, EnergyVadGate
 
 if TYPE_CHECKING:
@@ -45,6 +51,188 @@ RecognizerFactory = Callable[[str], StreamingRecognizer]
 PcmSourceFactory = Callable[[str, AudioCaptureConfig], PcmSource]
 LiveAudioFallbackStarter = Callable[["LiveAudioConfig", str], object]
 
+CAPTURE_BUFFER_DURATION_MS = 10_000
+
+
+@dataclass(frozen=True)
+class CapturedPcmChunk:
+    pcm: bytes
+    captured_at_ns: int
+
+
+class _CaptureStopSignal:
+    def __init__(self, parent: threading.Event) -> None:
+        self._parent = parent
+        self._local = threading.Event()
+
+    def is_set(self) -> bool:
+        return self._parent.is_set() or self._local.is_set()
+
+    def set(self) -> None:
+        self._local.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while not self.is_set():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._local.wait(min(remaining, 0.05))
+            else:
+                self._local.wait(0.05)
+        return True
+
+
+class _BufferedPcmCapture:
+    def __init__(
+        self,
+        source: PcmSource,
+        stop_event: threading.Event,
+        *,
+        capacity: int,
+        on_capture: Callable[[CapturedPcmChunk], None] | None = None,
+        on_drop: Callable[[int, int], None] | None = None,
+        on_capture_drop: Callable[[int, int], None] | None = None,
+    ) -> None:
+        if capacity <= 0:
+            raise ValueError("capture buffer capacity must be positive")
+        self.source = source
+        self.stop_event = stop_event
+        self.on_capture = on_capture
+        self.on_drop = on_drop
+        self.on_capture_drop = on_capture_drop
+        self._signal = _CaptureStopSignal(stop_event)
+        self._queue: queue.Queue[CapturedPcmChunk] = queue.Queue(maxsize=capacity)
+        self._capture_queue: queue.Queue[CapturedPcmChunk] | None = (
+            queue.Queue(maxsize=capacity) if on_capture is not None else None
+        )
+        self._capture_drop_lock = threading.Lock()
+        self._pending_capture_drop_frames = 0
+        self._pending_capture_drop_at_ns = 0
+        self._stream_drop_lock = threading.Lock()
+        self._pending_stream_drop_frames = 0
+        self._pending_stream_drop_at_ns = 0
+        self._done = threading.Event()
+        self._error: Exception | None = None
+        self._thread = threading.Thread(
+            target=self._produce,
+            name="mimir-pcm-capture",
+            daemon=True,
+        )
+        self._capture_thread = threading.Thread(
+            target=self._record_captured,
+            name="mimir-pcm-recording",
+            daemon=True,
+        )
+        self._started = False
+
+    def chunks(self) -> Iterator[CapturedPcmChunk]:
+        if self._started:
+            raise RuntimeError("capture stream can only be consumed once")
+        self._started = True
+        if self._capture_queue is not None:
+            self._capture_thread.start()
+        self._thread.start()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    item = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    if self._done.is_set():
+                        break
+                    continue
+                self._report_stream_drops()
+                yield item
+            self._report_stream_drops()
+            if self._error is not None and not self.stop_event.is_set():
+                raise self._error
+        finally:
+            self._signal.set()
+            self._thread.join(timeout=0.5)
+            if self._capture_queue is not None:
+                self._capture_thread.join()
+            self._report_stream_drops()
+
+    def _produce(self) -> None:
+        try:
+            for pcm in self.source.chunks(self._signal):  # type: ignore[arg-type]
+                if self._signal.is_set():
+                    break
+                item = CapturedPcmChunk(bytes(pcm), time.monotonic_ns())
+                self._queue_for_recording(item)
+                while not self._signal.is_set():
+                    try:
+                        self._queue.put_nowait(item)
+                        break
+                    except queue.Full:
+                        try:
+                            dropped = self._queue.get_nowait()
+                        except queue.Empty:
+                            continue
+                        with self._stream_drop_lock:
+                            self._pending_stream_drop_frames += len(dropped.pcm) // 2
+                            self._pending_stream_drop_at_ns = dropped.captured_at_ns
+        except Exception as error:
+            self._error = error
+        finally:
+            self._done.set()
+
+    def _queue_for_recording(self, item: CapturedPcmChunk) -> None:
+        capture_queue = self._capture_queue
+        if capture_queue is None:
+            return
+        while True:
+            try:
+                capture_queue.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    dropped = capture_queue.get_nowait()
+                except queue.Empty:
+                    continue
+                with self._capture_drop_lock:
+                    self._pending_capture_drop_frames += len(dropped.pcm) // 2
+                    self._pending_capture_drop_at_ns = dropped.captured_at_ns
+
+    def _record_captured(self) -> None:
+        capture_queue = self._capture_queue
+        if capture_queue is None or self.on_capture is None:
+            return
+        while not (self._done.is_set() and capture_queue.empty()):
+            try:
+                item = capture_queue.get(timeout=0.05)
+            except queue.Empty:
+                self._report_capture_drops()
+                continue
+            self.on_capture(item)
+            self._report_capture_drops()
+        self._report_capture_drops()
+
+    def _report_capture_drops(self) -> None:
+        callback = self.on_capture_drop
+        if callback is None:
+            return
+        with self._capture_drop_lock:
+            frames = self._pending_capture_drop_frames
+            captured_at_ns = self._pending_capture_drop_at_ns
+            self._pending_capture_drop_frames = 0
+            self._pending_capture_drop_at_ns = 0
+        if frames:
+            callback(frames, captured_at_ns)
+
+    def _report_stream_drops(self) -> None:
+        callback = self.on_drop
+        if callback is None:
+            return
+        with self._stream_drop_lock:
+            frames = self._pending_stream_drop_frames
+            captured_at_ns = self._pending_stream_drop_at_ns
+            self._pending_stream_drop_frames = 0
+            self._pending_stream_drop_at_ns = 0
+        if frames:
+            callback(frames, captured_at_ns)
+
 
 @dataclass(frozen=True)
 class LiveAudioConfig:
@@ -57,6 +245,7 @@ class LiveAudioConfig:
     device_ids: dict[str, str] = field(default_factory=dict)
     application_process_id: int = 0
     record_testing: bool = False
+    mic_gain: float = 2.0
 
 
 class LiveAudioController:
@@ -89,6 +278,9 @@ class LiveAudioController:
         self._recording_id = ""
         self._recording_sources: set[str] = set()
         self._recording_errors: list[str] = []
+        self._stop_requested_at_ns = 0
+        self._capture_drop_frames: dict[str, int] = {}
+        self._recording_drop_frames: dict[str, int] = {}
 
     def start(self, config: LiveAudioConfig, api_key: str) -> dict[str, object]:
         key = api_key.strip()
@@ -97,10 +289,14 @@ class LiveAudioController:
         sources = normalize_sources(config.sources)
         if not sources:
             raise ValueError("at least one audio source is required")
+        if not math.isfinite(config.mic_gain) or config.mic_gain <= 0:
+            raise ValueError("microphone gain must be a positive finite number")
 
         with self._lock:
             if self._running:
                 return self.snapshot_locked()
+            if any(thread.is_alive() for thread in self._threads.values()):
+                raise RuntimeError("Предыдущий звуковой поток еще завершается")
             self._stop_event = threading.Event()
             self._threads = {}
             self._recognizers = {}
@@ -115,15 +311,19 @@ class LiveAudioController:
                 device_ids=dict(config.device_ids),
                 application_process_id=config.application_process_id,
                 record_testing=config.record_testing,
+                mic_gain=float(config.mic_gain),
             )
             self._running = True
             self._fallback_started = False
             self._recording_id = ""
             self._recording_sources = set()
             self._recording_errors = []
+            self._stop_requested_at_ns = 0
+            self._capture_drop_frames = {source: 0 for source in sources}
+            self._recording_drop_frames = {source: 0 for source in sources}
 
-        recording_id = self._start_recording()
         self.session.start()
+        recording_id = self._start_recording()
         trace_live_event(
             "audio.start",
             mode=self.mode,
@@ -135,6 +335,7 @@ class LiveAudioController:
             deviceIds=self._config.device_ids,
             applicationProcessId=self._config.application_process_id,
             recordTesting=self._config.record_testing,
+            micGain=self._config.mic_gain,
             recordingId=recording_id,
         )
         self.publish(
@@ -168,6 +369,8 @@ class LiveAudioController:
             was_running = self._running
             self._running = False
             self._active_sources = set()
+            if was_running and not self._stop_requested_at_ns:
+                self._stop_requested_at_ns = time.monotonic_ns()
         if not was_running and not threads:
             return self.snapshot()
 
@@ -237,7 +440,10 @@ class LiveAudioController:
             "deviceIds": dict(config.device_ids) if config else {},
             "applicationProcessId": config.application_process_id if config else 0,
             "recordTesting": config.record_testing if config else False,
+            "micGain": config.mic_gain if config else 2.0,
             "recordingId": self._recording_id,
+            "captureDroppedFrames": dict(self._capture_drop_frames),
+            "recordingDroppedFrames": dict(self._recording_drop_frames),
             "tracePath": trace_path_payload(),
         }
 
@@ -256,6 +462,16 @@ class LiveAudioController:
         error_text = ""
         try:
             source_reader = self.source_factory(source, capture_config)
+            diagnostic_setter = getattr(source_reader, "set_diagnostic_callback", None)
+            if callable(diagnostic_setter):
+                diagnostic_setter(
+                    lambda event, payload: self._capture_diagnostic(
+                        source,
+                        recording_id,
+                        event,
+                        payload,
+                    )
+                )
             recognizer = self.recognizer_factory(api_key)
             with self._lock:
                 self._recognizers[source] = recognizer
@@ -264,9 +480,69 @@ class LiveAudioController:
                 sample_rate_hertz=config.sample_rate_hertz,
                 chunk_duration_ms=config.chunk_duration_ms,
             )
-            captured_chunks: Iterable[bytes] = source_reader.chunks(stop_event)
-            if recording_id:
-                captured_chunks = self._recording_chunks(source, captured_chunks, recording_id)
+            recording_failed = False
+
+            def record_chunk(item: CapturedPcmChunk) -> None:
+                nonlocal recording_failed
+                if not recording_id or recording_failed:
+                    return
+                store = self.recording_store
+                if store is None:
+                    recording_failed = True
+                    return
+                try:
+                    written = store.write(
+                        source,
+                        item.pcm,
+                        captured_at_ns=item.captured_at_ns,
+                        recording_id=recording_id,
+                    )
+                    if not written:
+                        raise RuntimeError("Хранилище отклонило звуковой фрагмент")
+                except Exception as error:
+                    recording_failed = True
+                    message = str(error) or error.__class__.__name__
+                    self._note_recording_error(recording_id, f"{source}: {message}")
+                    self._publish_recording_error(
+                        message,
+                        recording_id=recording_id,
+                        source=source,
+                    )
+
+            queue_capacity = max(
+                4,
+                (CAPTURE_BUFFER_DURATION_MS + config.chunk_duration_ms - 1)
+                // config.chunk_duration_ms,
+            )
+            capture = _BufferedPcmCapture(
+                source_reader,
+                stop_event,
+                capacity=queue_capacity,
+                on_capture=record_chunk if recording_id else None,
+                on_drop=lambda frames, captured_at_ns: self._capture_buffer_drop(
+                    source,
+                    recording_id,
+                    frames,
+                    captured_at_ns,
+                ),
+                on_capture_drop=(
+                    (
+                        lambda frames, captured_at_ns: self._recording_buffer_drop(
+                            source,
+                            recording_id,
+                            frames,
+                            captured_at_ns,
+                        )
+                    )
+                    if recording_id
+                    else None
+                ),
+            )
+            captured_chunks = (item.pcm for item in capture.chunks())
+            if source == MIC_SOURCE and config.mic_gain != 1.0:
+                captured_chunks = (
+                    apply_pcm16_gain(chunk, config.mic_gain) for chunk in captured_chunks
+                )
             chunks = self._stt_chunks(
                 source,
                 captured_chunks,
@@ -279,7 +555,11 @@ class LiveAudioController:
             )
             runner = SpeechKitStreamRunner(recognizer, stream_config)
             for event in runner.run(source, chunks):
-                self.record_stt_result(event.source, event.is_final)
+                self.record_stt_result(
+                    event.source,
+                    event.is_final,
+                    is_refinement=event.is_refinement,
+                )
                 trace_live_event(
                     "stt.transcript",
                     source=event.source,
@@ -326,6 +606,7 @@ class LiveAudioController:
             descriptor = store.start(
                 application={"processId": config.application_process_id},
                 audio_mode=self.mode,
+                app_revision=os.environ.get("MIMIR_APP_REVISION", "").strip() or __version__,
                 started_monotonic_ns=time.monotonic_ns(),
             )
             recording_id = str(store.active_recording_id() or "")
@@ -351,30 +632,114 @@ class LiveAudioController:
         )
         return recording_id
 
-    def _recording_chunks(
+    def _capture_diagnostic(
         self,
         source: str,
-        chunks: Iterable[bytes],
         recording_id: str,
-    ) -> Iterator[bytes]:
+        event: str,
+        payload: dict[str, object],
+    ) -> None:
+        clean_payload = {"source": source, "mode": self.mode, **payload}
+        trace_live_event(event, **clean_payload)
         store = self.recording_store
-        recording_failed = store is None
-        for chunk in chunks:
-            if not recording_failed and store is not None:
-                try:
-                    written = store.write(
-                        source,
-                        chunk,
-                        captured_at_ns=time.monotonic_ns(),
-                    )
-                    if not written:
-                        raise RuntimeError("Хранилище отклонило звуковой фрагмент")
-                except Exception as error:
-                    recording_failed = True
-                    message = str(error) or error.__class__.__name__
-                    self._note_recording_error(recording_id, f"{source}: {message}")
-                    self._publish_recording_error(message, recording_id=recording_id, source=source)
-            yield chunk
+        recorder = getattr(store, "record_event", None)
+        if recording_id and callable(recorder):
+            recorder(event, **clean_payload)
+        status = "failed" if event.endswith(".failed") else "reconnecting"
+        self.publish(
+            "audio_status",
+            {
+                "source": source,
+                "mode": self.mode,
+                "status": status,
+                "phase": "application_capture_refresh",
+                "running": True,
+                **payload,
+            },
+        )
+
+    def _capture_buffer_drop(
+        self,
+        source: str,
+        recording_id: str,
+        frames: int,
+        captured_at_ns: int,
+    ) -> None:
+        config = self._config
+        sample_width = 2
+        byte_count = frames * sample_width
+        with self._lock:
+            previous = self._capture_drop_frames.get(source, 0)
+            total = previous + frames
+            self._capture_drop_frames[source] = total
+        payload = {
+            "source": source,
+            "mode": self.mode,
+            "frames": frames,
+            "bytes": byte_count,
+            "totalDroppedFrames": total,
+            "droppedAudioMs": (
+                round(total * 1000 / config.sample_rate_hertz) if config is not None else 0
+            ),
+        }
+        trace_live_event("audio.capture_buffer_overflow", **payload)
+        store = self.recording_store
+        recorder = getattr(store, "record_stream_drop", None)
+        if recording_id and callable(recorder):
+            recorder(
+                source,
+                frames,
+                captured_at_ns=captured_at_ns,
+            )
+        if previous == 0:
+            message = "Очередь захвата звука переполнилась; старый фрагмент пропущен"
+            self.publish(
+                "audio_error",
+                {
+                    **payload,
+                    "phase": "capture_buffer_overflow",
+                    "error": message,
+                    "running": True,
+                },
+            )
+            self.mark_degraded("capture_buffer_overflow", message)
+
+    def _recording_buffer_drop(
+        self,
+        source: str,
+        recording_id: str,
+        frames: int,
+        captured_at_ns: int,
+    ) -> None:
+        config = self._config
+        with self._lock:
+            previous = self._recording_drop_frames.get(source, 0)
+            total = previous + frames
+            self._recording_drop_frames[source] = total
+        payload = {
+            "source": source,
+            "mode": self.mode,
+            "frames": frames,
+            "totalDroppedFrames": total,
+            "droppedAudioMs": (
+                round(total * 1000 / config.sample_rate_hertz) if config is not None else 0
+            ),
+        }
+        trace_live_event("audio.recording_buffer_overflow", **payload)
+        store = self.recording_store
+        recorder = getattr(store, "record_capture_drop", None)
+        if callable(recorder):
+            recorder(
+                source,
+                frames,
+                captured_at_ns=captured_at_ns,
+            )
+        if previous == 0:
+            self._publish_recording_error(
+                "Очередь записи звука переполнилась; в записи будет отмечен пропуск",
+                recording_id=recording_id,
+                source=source,
+            )
 
     def _note_recording_error(self, recording_id: str, error: str) -> None:
         with self._lock:
@@ -400,19 +765,31 @@ class LiveAudioController:
         if store is None:
             return
         try:
-            store.finish(error=final_error)
+            completed = store.finish(
+                error=final_error,
+                finished_monotonic_ns=self._stop_requested_at_ns or time.monotonic_ns(),
+            )
         except Exception as finish_error:
             self._publish_recording_error(
                 str(finish_error) or finish_error.__class__.__name__,
                 recording_id=recording_id,
             )
             return
+        recording_status = (
+            str(completed.get("status") or "") if isinstance(completed, dict) else ""
+        )
+        public_status = {
+            "complete": "completed",
+            "incomplete": "incomplete",
+            "failed": "failed",
+        }.get(recording_status, "failed" if final_error else "completed")
         self.publish(
             "testing_recording_status",
             {
-                "status": "failed" if final_error else "completed",
+                "status": public_status,
                 "recordingId": recording_id,
                 "error": final_error,
+                "recordingStatus": recording_status,
             },
         )
 
@@ -475,6 +852,7 @@ class LiveAudioController:
                 self.record_audio_speech_started(source)
             if decision.speech_ended:
                 self.publish("audio_status", {"source": source, "mode": self.mode, "status": "silence"})
+                self.record_audio_speech_ended(source, decision.trailing_silence_ms)
             for stt_chunk in decision.audio_chunks:
                 self.record_audio_chunk(source, len(stt_chunk))
                 yield stt_chunk
@@ -501,15 +879,26 @@ class LiveAudioController:
         if callable(recorder):
             recorder(source)
 
+    def record_audio_speech_ended(self, source: str, trailing_silence_ms: int = 0) -> None:
+        recorder = getattr(self.session, "record_audio_speech_ended", None)
+        if callable(recorder):
+            recorder(source, trailing_silence_ms=trailing_silence_ms)
+
     def record_audio_chunk(self, source: str, byte_count: int) -> None:
         recorder = getattr(self.session, "record_audio_chunk", None)
         if callable(recorder):
             recorder(source, byte_count)
 
-    def record_stt_result(self, source: str, is_final: bool) -> None:
+    def record_stt_result(
+        self,
+        source: str,
+        is_final: bool,
+        *,
+        is_refinement: bool = False,
+    ) -> None:
         recorder = getattr(self.session, "record_stt_result", None)
         if callable(recorder):
-            recorder(source, is_final)
+            recorder(source, is_final, is_refinement=is_refinement)
 
     def mark_degraded(self, phase: str, error: str) -> None:
         marker = getattr(self.session, "mark_degraded", None)
@@ -567,3 +956,22 @@ def normalize_sources(sources: Iterable[str]) -> tuple[str, ...]:
         if clean not in normalized:
             normalized.append(clean)
     return tuple(normalized)
+
+
+def apply_pcm16_gain(pcm: bytes, gain: float) -> bytes:
+    raw = bytes(pcm)
+    if not raw or gain == 1.0:
+        return raw
+    if len(raw) % 2:
+        raise ValueError("PCM block must contain complete 16-bit samples")
+    if not math.isfinite(gain) or gain <= 0:
+        raise ValueError("PCM gain must be a positive finite number")
+    samples = array("h")
+    samples.frombytes(raw)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    for index, sample in enumerate(samples):
+        samples[index] = max(-32_768, min(32_767, round(sample * gain)))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()

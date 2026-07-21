@@ -243,6 +243,11 @@ class RealtimeAudioController:
         with self._lock:
             return self.snapshot_locked()
 
+    def has_live_threads(self) -> bool:
+        with self._lock:
+            self._prune_thread_locked()
+            return self._thread is not None and self._thread.is_alive()
+
     def snapshot_locked(self) -> dict[str, object]:
         config = self._config
         return {
@@ -448,7 +453,11 @@ class RealtimeAudioController:
             for event in runner.run(MIC_SOURCE, chunks):
                 if stop_event.is_set():
                     return
-                self.record_stt_result(MIC_SOURCE, event.is_final)
+                self.record_stt_result(
+                    MIC_SOURCE,
+                    event.is_final,
+                    is_refinement=event.is_refinement,
+                )
                 self.session.ingest_transcript(
                     MIC_SOURCE,
                     event.text,
@@ -518,6 +527,7 @@ class RealtimeAudioController:
     ) -> None:
         current_question_id = ""
         last_remote_text = ""
+        last_remote_utterance_sequence = 0
         async for message in client.events():
             if stop_event.is_set():
                 return
@@ -527,7 +537,10 @@ class RealtimeAudioController:
                 if text:
                     trace_live_event("realtime.remote.transcript", text=text)
                     last_remote_text = text
-                    self.record_stt_result(REMOTE_SOURCE, True)
+                    last_remote_utterance_sequence = self.record_stt_result(
+                        REMOTE_SOURCE,
+                        True,
+                    )
                     self.session.ingest_transcript(REMOTE_SOURCE, text, is_final=True, detect_question=False)
                     self._enqueue_dialogue_context_now(queue, REMOTE_SOURCE)
                     self._enqueue_realtime_instructions_now(queue, REMOTE_SOURCE)
@@ -546,7 +559,10 @@ class RealtimeAudioController:
                     continue
                 trace_live_event("realtime.answer.delta", delta=delta)
                 if not current_question_id:
-                    current_question_id = self._publish_realtime_question(last_remote_text)
+                    current_question_id = self._publish_realtime_question(
+                        last_remote_text,
+                        last_remote_utterance_sequence,
+                    )
                 self.record_answer_delta(current_question_id, delta)
                 self.record_answer_first_hint(current_question_id, provider="yandex_realtime")
                 self.publish(
@@ -569,7 +585,7 @@ class RealtimeAudioController:
                 text = str(error.get("message") if isinstance(error, dict) else error)
                 self._publish_error(REMOTE_SOURCE, text, running=True, phase="server_event")
 
-    def _publish_realtime_question(self, text: str) -> str:
+    def _publish_realtime_question(self, text: str, utterance_sequence: int = 0) -> str:
         question_id = f"realtime_{uuid.uuid4().hex[:12]}"
         question = text.strip() or "Realtime remote prompt"
         self.publish(
@@ -585,7 +601,12 @@ class RealtimeAudioController:
                 },
             },
         )
-        self.record_external_question(question_id, question, provider="yandex_realtime")
+        self.record_external_question(
+            question_id,
+            question,
+            provider="yandex_realtime",
+            utterance_sequence=utterance_sequence,
+        )
         return question_id
 
     def _source_reader(self, source: str, config: RealtimeAudioConfig) -> PcmSource:
@@ -633,6 +654,7 @@ class RealtimeAudioController:
                 self.record_audio_speech_started(source)
             if decision.speech_ended:
                 self.publish("audio_status", {"source": source, "mode": "yandex_realtime", "status": "silence"})
+                self.record_audio_speech_ended(source, decision.trailing_silence_ms)
             for stt_chunk in decision.audio_chunks:
                 self.record_audio_chunk(source, len(stt_chunk))
                 yield stt_chunk
@@ -746,20 +768,46 @@ class RealtimeAudioController:
         if callable(recorder):
             recorder(source)
 
+    def record_audio_speech_ended(self, source: str, trailing_silence_ms: int = 0) -> None:
+        recorder = getattr(self.session, "record_audio_speech_ended", None)
+        if callable(recorder):
+            recorder(source, trailing_silence_ms=trailing_silence_ms)
+
     def record_audio_chunk(self, source: str, byte_count: int) -> None:
         recorder = getattr(self.session, "record_audio_chunk", None)
         if callable(recorder):
             recorder(source, byte_count)
 
-    def record_stt_result(self, source: str, is_final: bool) -> None:
+    def record_stt_result(
+        self,
+        source: str,
+        is_final: bool,
+        *,
+        is_refinement: bool = False,
+    ) -> int:
         recorder = getattr(self.session, "record_stt_result", None)
         if callable(recorder):
-            recorder(source, is_final)
+            sequence = recorder(source, is_final, is_refinement=is_refinement)
+            return sequence if isinstance(sequence, int) else 0
+        return 0
 
-    def record_external_question(self, question_id: str, question: str, *, provider: str) -> None:
+    def record_external_question(
+        self,
+        question_id: str,
+        question: str,
+        *,
+        provider: str,
+        utterance_sequence: int = 0,
+    ) -> None:
         recorder = getattr(self.session, "record_external_question", None)
         if callable(recorder):
-            recorder(question_id, question, provider=provider, source=REMOTE_SOURCE)
+            recorder(
+                question_id,
+                question,
+                provider=provider,
+                source=REMOTE_SOURCE,
+                utterance_sequence=utterance_sequence,
+            )
 
     def record_answer_first_hint(self, question_id: str, *, provider: str) -> None:
         recorder = getattr(self.session, "record_answer_first_hint", None)

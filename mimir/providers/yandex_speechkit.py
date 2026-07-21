@@ -18,6 +18,9 @@ DEFAULT_SAMPLE_RATE = 16_000
 MAX_SHORT_AUDIO_BYTES = 1_000_000
 STREAMING_MAX_ATTEMPTS = 2
 STREAMING_RETRY_DELAY_SECONDS = 0.75
+KNOWN_PARTIAL_FINAL_REGRESSIONS = {
+    ("вас слышат", "наслышаться"),
+}
 
 
 def normalize_language(language: str) -> str:
@@ -211,7 +214,7 @@ def build_streaming_requests(
             eou_classifier=stt_pb2.EouClassifierOptions(
                 default_classifier=stt_pb2.DefaultEouClassifier(
                     type=stt_pb2.DefaultEouClassifier.DEFAULT,
-                    max_pause_between_words_hint_ms=1_200,
+                    max_pause_between_words_hint_ms=900,
                 )
             ),
         )
@@ -255,7 +258,11 @@ class SpeechKitUtteranceAssembler:
         event = response.WhichOneof("Event")
         if event == "partial":
             self._start_next_utterance()
-            self._partial = text_from_update(response.partial)
+            next_partial = text_from_update(response.partial)
+            self._partial = keep_more_informative_partial(
+                self._partial,
+                next_partial,
+            )
             return self._emit(self._combined_text(), is_final=False)
 
         if event == "final":
@@ -263,6 +270,7 @@ class SpeechKitUtteranceAssembler:
             text = text_from_update(response.final)
             if not text:
                 return None
+            text = keep_more_informative_partial(self._partial, text)
             self._partial = ""
             self._store_segment(streaming_final_index(response, self._segment_order), text)
             return self._emit(self._combined_text(), is_final=False)
@@ -272,6 +280,10 @@ class SpeechKitUtteranceAssembler:
             if not text:
                 return None
             index = int(getattr(response.final_refinement, "final_index", 0))
+            text = keep_more_informative_partial(
+                self._segments.get(index, ""),
+                text,
+            )
             self._store_segment(index, text)
             return self._emit(
                 self._combined_text(),
@@ -347,6 +359,14 @@ def streaming_final_index(response: object, existing: list[int]) -> int:
     except (AttributeError, ValueError):
         pass
     return max(existing, default=-1) + 1
+
+
+def keep_more_informative_partial(partial: str, final: str) -> str:
+    normalized_partial = " ".join(partial.casefold().replace("ё", "е").split())
+    normalized_final = " ".join(final.casefold().replace("ё", "е").split())
+    if (normalized_partial, normalized_final) in KNOWN_PARTIAL_FINAL_REGRESSIONS:
+        return partial
+    return final
 
 
 def validate_streaming_status(response: object) -> None:

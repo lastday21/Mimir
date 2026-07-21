@@ -15,9 +15,11 @@ class SessionMetrics:
     def reset(self) -> None:
         self.values: dict[str, Any] = {}
         self.sources: dict[str, dict[str, Any]] = {}
+        self.utterances: dict[tuple[str, int], dict[str, Any]] = {}
         self.questions: list[dict[str, Any]] = []
         self.questions_by_id: dict[str, dict[str, Any]] = {}
         self.question_runtime: dict[str, dict[str, float]] = {}
+        self.finalized_utterances: dict[str, dict[str, Any]] = {}
 
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
@@ -32,26 +34,43 @@ class SessionMetrics:
         self.values[key] = int(self.values.get(key, 0)) + 1
         self.values["updatedAt"] = wall_ms()
 
-    def record_speech_started(self, session_id: str, source: str) -> None:
+    def decrement(self, key: str) -> None:
+        self.values[key] = max(0, int(self.values.get(key, 0)) - 1)
+        self.values["updatedAt"] = wall_ms()
+
+    def record_speech_started(self, session_id: str, source: str, sequence: int = 0) -> None:
         now = time.monotonic()
-        self.sources[source] = {
+        metric = {
             "source": source,
+            "utteranceSequence": sequence,
             "speechStartedAtMs": wall_ms(),
             "_speechStartedAt": now,
         }
+        self.sources[source] = metric
+        if sequence > 0:
+            self.utterances[(source, sequence)] = metric
         self.trace_stage(session_id, source=source, stage="speech_started", elapsed_ms=0)
 
-    def record_audio_chunk(self, session_id: str, source: str, byte_count: int) -> None:
+    def record_audio_chunk(
+        self,
+        session_id: str,
+        source: str,
+        byte_count: int,
+        sequence: int = 0,
+    ) -> None:
         now = time.monotonic()
         now_ms = wall_ms()
-        metric = self.sources.setdefault(
-            source,
-            {
-                "source": source,
-                "speechStartedAtMs": now_ms,
-                "_speechStartedAt": now,
-            },
-        )
+        metric = self.utterances.get((source, sequence)) if sequence > 0 else None
+        if metric is None:
+            metric = self.sources.setdefault(
+                source,
+                {
+                    "source": source,
+                    "utteranceSequence": sequence,
+                    "speechStartedAtMs": now_ms,
+                    "_speechStartedAt": now,
+                },
+            )
         if "audioChunkAtMs" in metric:
             return
         started = float(metric.get("_speechStartedAt", now))
@@ -68,20 +87,95 @@ class SessionMetrics:
             bytes=byte_count,
         )
 
-    def record_stt_result(self, session_id: str, source: str, is_final: bool) -> None:
+    def record_speech_ended(
+        self,
+        session_id: str,
+        source: str,
+        trailing_silence_ms: int = 0,
+        sequence: int = 0,
+    ) -> None:
+        now = time.monotonic()
+        requested_trailing_ms = max(0, int(trailing_silence_ms))
+        metric = self.utterances.get((source, sequence)) if sequence > 0 else None
+        if metric is None:
+            metric = self.sources.setdefault(
+                source,
+                {"source": source, "utteranceSequence": sequence},
+            )
+        started = float(metric.get("_speechStartedAt", now))
+        speech_ended_at = max(started, now - requested_trailing_ms / 1000)
+        trailing_ms = max(0, round((now - speech_ended_at) * 1000))
+        closed_at_ms = wall_ms()
+        started_at_ms = int(metric.get("speechStartedAtMs", closed_at_ms))
+        metric["speechEndedAtMs"] = started_at_ms + elapsed_ms(started, speech_ended_at)
+        metric["vadClosedAtMs"] = closed_at_ms
+        metric["vadTailMs"] = requested_trailing_ms
+        metric["trailingSilenceMs"] = trailing_ms
+        metric["_speechEndedAt"] = speech_ended_at
+        for question in self.questions:
+            if (
+                question.get("source") != source
+                or int(question.get("utteranceSequence", 0)) != sequence
+            ):
+                continue
+            question_id = str(question.get("questionId", ""))
+            runtime = self.question_runtime.get(question_id)
+            question["utteranceEndedAtMs"] = metric["speechEndedAtMs"]
+            question["_utteranceEndedAt"] = speech_ended_at
+            question["latencyBaseline"] = "speech_end"
+            question["vadTailMs"] = requested_trailing_ms
+            question["trailingSilenceMs"] = trailing_ms
+            if runtime is None:
+                continue
+            runtime["utteranceEndedAt"] = speech_ended_at
+            first_hint_at = runtime.get("firstHintAt")
+            if first_hint_at is not None:
+                question["tFirstHintMs"] = max(
+                    0,
+                    elapsed_ms(speech_ended_at, float(first_hint_at)),
+                )
+            answer_done_at = runtime.get("answerDoneAt")
+            if answer_done_at is not None:
+                question["tAnswerDoneMs"] = max(
+                    0,
+                    elapsed_ms(speech_ended_at, float(answer_done_at)),
+                )
+            self.trace_question(question)
+        finalized = self.finalized_utterances.get(source)
+        if finalized is not None and int(finalized.get("utteranceSequence", 0)) == sequence:
+            self.finalized_utterances[source] = dict(metric)
+        self.trace_stage(
+            session_id,
+            source=source,
+            stage="speech_ended",
+            elapsed_ms=elapsed_ms(started, speech_ended_at),
+            trailingSilenceMs=trailing_ms,
+            vadTailMs=requested_trailing_ms,
+        )
+
+    def record_stt_result(
+        self,
+        session_id: str,
+        source: str,
+        is_final: bool,
+        sequence: int = 0,
+    ) -> None:
         now = time.monotonic()
         now_ms = wall_ms()
-        metric = self.sources.setdefault(
-            source,
-            {
-                "source": source,
-                "speechStartedAtMs": now_ms,
-                "_speechStartedAt": now,
-                "audioChunkAtMs": now_ms,
-                "_audioChunkAt": now,
-                "tAudioChunkMs": 0,
-            },
-        )
+        metric = self.utterances.get((source, sequence)) if sequence > 0 else None
+        if metric is None:
+            metric = self.sources.setdefault(
+                source,
+                {
+                    "source": source,
+                    "utteranceSequence": sequence,
+                    "speechStartedAtMs": now_ms,
+                    "_speechStartedAt": now,
+                    "audioChunkAtMs": now_ms,
+                    "_audioChunkAt": now,
+                    "tAudioChunkMs": 0,
+                },
+            )
         audio_at = float(metric.get("_audioChunkAt", now))
         if not is_final and "tSttInterimMs" not in metric:
             elapsed = elapsed_ms(audio_at, now)
@@ -94,6 +188,7 @@ class SessionMetrics:
             metric["sttFinalAtMs"] = now_ms
             metric["_sttFinalAt"] = now
             metric["tSttFinalMs"] = elapsed
+            self.finalized_utterances[source] = dict(metric)
             self.trace_stage(session_id, source=source, stage="stt_final", elapsed_ms=elapsed)
 
     def build_question(
@@ -110,8 +205,15 @@ class SessionMetrics:
         context_done: float,
         provider: str,
         cancelled_streams: int,
+        utterance_sequence: int = 0,
     ) -> dict[str, Any]:
-        source_metric = self.sources.get(source, {})
+        source_metric = (
+            self.utterances.get((source, utterance_sequence))
+            if utterance_sequence > 0
+            else None
+        )
+        if source_metric is None:
+            source_metric = self.finalized_utterances.get(source, self.sources.get(source, {}))
         metric = {
             "sessionId": session_id,
             "questionId": question_id,
@@ -125,14 +227,28 @@ class SessionMetrics:
             "createdAtMs": wall_ms(),
             "tDetectMs": elapsed_ms(detected_started, detected_done),
             "tContextBuildMs": elapsed_ms(context_started, context_done),
+            "latencySchemaVersion": 2,
         }
         for source_key, target_key in (
+            ("utteranceSequence", "utteranceSequence"),
             ("tAudioChunkMs", "tAudioChunkMs"),
             ("tSttInterimMs", "tSttInterimMs"),
             ("tSttFinalMs", "tSttFinalMs"),
+            ("vadTailMs", "vadTailMs"),
+            ("trailingSilenceMs", "trailingSilenceMs"),
         ):
             if source_key in source_metric:
                 metric[target_key] = source_metric[source_key]
+        if "speechEndedAtMs" in source_metric:
+            metric["utteranceEndedAtMs"] = source_metric["speechEndedAtMs"]
+            metric["_utteranceEndedAt"] = source_metric.get("_speechEndedAt")
+            metric["latencyBaseline"] = "speech_end"
+        elif "sttFinalAtMs" in source_metric:
+            metric["utteranceEndedAtMs"] = source_metric["sttFinalAtMs"]
+            metric["_utteranceEndedAt"] = source_metric.get("_sttFinalAt")
+            metric["latencyBaseline"] = "stt_final"
+        else:
+            metric["latencyBaseline"] = "question_ready"
         return metric
 
     def add_question(self, session_id: str, metric: dict[str, Any], *, question_ready_at: float) -> None:
@@ -140,7 +256,10 @@ class SessionMetrics:
         self.questions.append(metric)
         self.questions = self.questions[-50:]
         self.questions_by_id[question_id] = metric
-        self.question_runtime[question_id] = {"questionReadyAt": question_ready_at}
+        self.question_runtime[question_id] = {
+            "questionReadyAt": question_ready_at,
+            "utteranceEndedAt": float(metric.get("_utteranceEndedAt") or question_ready_at),
+        }
         self.trace_stage(
             session_id,
             source=str(metric["source"]),
@@ -163,7 +282,9 @@ class SessionMetrics:
         if metric is None or runtime is None or "tFirstHintMs" in metric:
             return
         metric["firstHintAtMs"] = wall_ms()
-        metric["tFirstHintMs"] = elapsed_ms(runtime["questionReadyAt"], now)
+        runtime["firstHintAt"] = now
+        metric["tQuestionToFirstHintMs"] = elapsed_ms(runtime["questionReadyAt"], now)
+        metric["tFirstHintMs"] = elapsed_ms(runtime["utteranceEndedAt"], now)
         if provider:
             metric["provider"] = provider
         self.trace_question(metric)
@@ -175,7 +296,9 @@ class SessionMetrics:
         if metric is None or runtime is None:
             return
         metric["answerDoneAtMs"] = wall_ms()
-        metric["tAnswerDoneMs"] = elapsed_ms(runtime["questionReadyAt"], now)
+        runtime["answerDoneAt"] = now
+        metric["tQuestionToAnswerDoneMs"] = elapsed_ms(runtime["questionReadyAt"], now)
+        metric["tAnswerDoneMs"] = elapsed_ms(runtime["utteranceEndedAt"], now)
         self.trace_question(metric)
 
     def set_question_field(self, question_id: str, key: str, value: Any) -> None:

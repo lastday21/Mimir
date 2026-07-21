@@ -6,7 +6,11 @@ from typing import Any
 
 from .dialogue import REMOTE_SOURCE, ContextSnapshot
 from .live_trace import trace_live_event
-from .prompts import build_realtime_messages, build_transcript_decision_messages
+from .prompts import (
+    build_realtime_messages,
+    build_transcript_decision_messages,
+    requires_transcript_clarification,
+)
 from .session_types import (
     AnswerStreamChunk,
     answer_chunk,
@@ -20,7 +24,12 @@ from .session_types import (
 class SessionAnswerFlow:
     REMOTE_UTTERANCE_SETTLE_SECONDS = 0.3
 
-    def _schedule_remote_utterance(self, text: str, timestamp_ms: int) -> None:
+    def _schedule_remote_utterance(
+        self,
+        text: str,
+        timestamp_ms: int,
+        utterance_sequence: int = 0,
+    ) -> None:
         with self._condition:
             generation = self._generation
             pending = self._pending_candidate_timer
@@ -29,7 +38,7 @@ class SessionAnswerFlow:
             timer = threading.Timer(
                 self.REMOTE_UTTERANCE_SETTLE_SECONDS,
                 self._run_scheduled_remote_utterance,
-                args=(text, timestamp_ms, generation),
+                args=(text, timestamp_ms, generation, utterance_sequence),
             )
             timer.daemon = True
             self._pending_candidate_timer = timer
@@ -40,12 +49,13 @@ class SessionAnswerFlow:
         text: str,
         timestamp_ms: int,
         generation: int,
+        utterance_sequence: int,
     ) -> None:
         with self._condition:
             if generation != self._generation or self._state in {"paused", "stopped"}:
                 return
             self._pending_candidate_timer = None
-        self._consider_remote_utterance(text, timestamp_ms)
+        self._consider_remote_utterance(text, timestamp_ms, utterance_sequence)
 
     def _cancel_pending_remote_utterance(self) -> None:
         with self._condition:
@@ -54,7 +64,12 @@ class SessionAnswerFlow:
         if pending is not None:
             pending.cancel()
 
-    def _consider_remote_utterance(self, text: str, timestamp_ms: int) -> None:
+    def _consider_remote_utterance(
+        self,
+        text: str,
+        timestamp_ms: int,
+        utterance_sequence: int = 0,
+    ) -> None:
         key = normalize_question_key(text)
         now = time.monotonic()
         with self._condition:
@@ -90,6 +105,7 @@ class SessionAnswerFlow:
                 context_started,
                 context_done,
                 context,
+                utterance_sequence,
             ),
             name=f"mimir-decision-{candidate_sequence}",
             daemon=True,
@@ -108,7 +124,11 @@ class SessionAnswerFlow:
         context_started: float,
         context_done: float,
         context: ContextSnapshot,
+        utterance_sequence: int,
     ) -> None:
+        if requires_transcript_clarification(utterance):
+            self._record_unclear_utterance(generation, candidate_sequence, utterance)
+            return
         messages = build_transcript_decision_messages(
             utterance,
             context.to_background_text(),
@@ -148,6 +168,7 @@ class SessionAnswerFlow:
                         context_done,
                         context,
                         chunk.provider,
+                        utterance_sequence,
                     )
                     if not question_id:
                         return
@@ -192,6 +213,7 @@ class SessionAnswerFlow:
                     context_done,
                     context,
                     last_chunk.provider,
+                    utterance_sequence,
                 )
                 if not question_id:
                     return
@@ -254,6 +276,7 @@ class SessionAnswerFlow:
         context_done: float,
         context: ContextSnapshot,
         provider: str,
+        utterance_sequence: int = 0,
     ) -> str:
         with self._condition:
             if (
@@ -276,6 +299,7 @@ class SessionAnswerFlow:
                 context_started=context_started,
                 context_done=context_done,
                 provider=provider,
+                utterance_sequence=utterance_sequence,
             )
             self.add_question_metric_locked(metric, question_ready_at=detected_done)
             payload = {
@@ -365,18 +389,37 @@ class SessionAnswerFlow:
 
     def _record_unclear_utterance(self, generation: int, candidate_sequence: int, text: str) -> None:
         message = "Не уверен, что правильно расслышал вопрос. Лучше переспросить."
+        summary_source = None
         with self._condition:
             if generation != self._generation or candidate_sequence != self._candidate_sequence:
                 return
+            marked = self._memory.mark_latest_uncertain(REMOTE_SOURCE, text)
+            if marked is not None:
+                summary_source = (
+                    self._generation,
+                    self._session_id,
+                    self._memory.summary,
+                    *self._memory.summary_source(),
+                )
+            self._cancel_answer.set()
+            self._active_question_id = ""
+            self._current_question = None
+            self._current_answer_text = ""
+            if self._state == "answering":
+                self._state = "listening"
+            self.publish_locked("session_state", self.snapshot_locked())
             self._metric_store.increment("unclearUtterances")
             self.publish_locked(
                 "transcript_uncertain",
                 {
                     "sessionId": self._session_id,
+                    "turnId": marked.turn_id if marked is not None else "",
                     "heardText": text,
                     "message": message,
                 },
             )
+        if summary_source is not None:
+            self._summary.observe(*summary_source, force=True)
         trace_live_event("session.utterance_uncertain", text=text)
 
     def trigger_question(

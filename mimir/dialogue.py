@@ -5,7 +5,6 @@ import uuid
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 
 
 REMOTE_SOURCE = "remote"
@@ -21,6 +20,12 @@ class DialogueTurn:
     is_final: bool = True
     timestamp_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     turn_id: str = field(default_factory=lambda: f"turn_{uuid.uuid4().hex}")
+    started_at_ms: int = 0
+    uncertain: bool = False
+
+    def __post_init__(self) -> None:
+        if self.started_at_ms <= 0:
+            object.__setattr__(self, "started_at_ms", self.timestamp_ms)
 
 
 @dataclass(frozen=True)
@@ -110,7 +115,15 @@ class DialogueMemory:
             latest_id = self._latest_final.get(turn.source)
             index = self._turn_index(latest_id)
             if index is not None:
-                stored = DialogueTurn(turn.source, text, True, turn.timestamp_ms, latest_id)
+                current = self.turns[index]
+                stored = DialogueTurn(
+                    turn.source,
+                    text,
+                    True,
+                    turn.timestamp_ms,
+                    latest_id,
+                    current.started_at_ms,
+                )
                 self.turns[index] = stored
                 self._pending_interim.pop(turn.source, None)
                 self._refresh_active_topic()
@@ -119,7 +132,15 @@ class DialogueMemory:
         pending_id = self._pending_interim.get(turn.source)
         index = self._turn_index(pending_id)
         if index is not None:
-            stored = DialogueTurn(turn.source, text, turn.is_final, turn.timestamp_ms, pending_id)
+            current = self.turns[index]
+            stored = DialogueTurn(
+                turn.source,
+                text,
+                turn.is_final,
+                turn.timestamp_ms,
+                pending_id,
+                current.started_at_ms,
+            )
             self.turns[index] = stored
             if turn.is_final:
                 self._pending_interim.pop(turn.source, None)
@@ -128,7 +149,14 @@ class DialogueMemory:
             return TranscriptUpdate(stored, "replace")
         self._pending_interim.pop(turn.source, None)
 
-        stored = DialogueTurn(turn.source, text, turn.is_final, turn.timestamp_ms, turn.turn_id)
+        stored = DialogueTurn(
+            turn.source,
+            text,
+            turn.is_final,
+            turn.timestamp_ms,
+            turn.turn_id,
+            turn.started_at_ms,
+        )
         self.turns.append(stored)
         if turn.is_final:
             self._latest_final[turn.source] = stored.turn_id
@@ -137,59 +165,32 @@ class DialogueMemory:
         self._refresh_active_topic()
         return TranscriptUpdate(stored, "append")
 
-    def find_cross_source_duplicate(
-        self,
-        turn: DialogueTurn,
-        *,
-        window_ms: int = 2_500,
-    ) -> DialogueTurn | None:
-        for current in reversed(self.turns):
-            if current.source == turn.source:
+    def mark_latest_uncertain(self, source: str, text: str) -> DialogueTurn | None:
+        normalized = normalize_transcript_tokens(text)
+        for index in range(len(self.turns) - 1, -1, -1):
+            current = self.turns[index]
+            if current.source != source or not current.is_final:
                 continue
-            if abs(turn.timestamp_ms - current.timestamp_ms) > window_ms:
+            if normalize_transcript_tokens(current.text) != normalized:
                 continue
-            if transcripts_look_same(current.text, turn.text):
+            if current.uncertain:
                 return current
-        return None
-
-    def remove_turn(self, turn_id: str) -> DialogueTurn | None:
-        index = self._turn_index(turn_id)
-        if index is None:
-            return None
-        removed = self.turns.pop(index)
-        if self._pending_interim.get(removed.source) == turn_id:
-            self._pending_interim.pop(removed.source, None)
-        if self._latest_final.get(removed.source) == turn_id:
-            previous = next(
-                (
-                    turn.turn_id
-                    for turn in reversed(self.turns)
-                    if turn.source == removed.source and turn.is_final
-                ),
-                "",
+            marked = DialogueTurn(
+                current.source,
+                current.text,
+                current.is_final,
+                current.timestamp_ms,
+                current.turn_id,
+                current.started_at_ms,
+                True,
             )
-            if previous:
-                self._latest_final[removed.source] = previous
-            else:
-                self._latest_final.pop(removed.source, None)
-        for exchange in self.exchanges:
-            exchange.user_turns = [turn for turn in exchange.user_turns if turn.turn_id != turn_id]
-        self._refresh_active_topic()
-        return removed
-
-    def remove_latest_matching_turn(
-        self,
-        source: str,
-        text: str,
-        *,
-        timestamp_ms: int,
-        window_ms: int = 2_500,
-    ) -> DialogueTurn | None:
-        for current in reversed(self.turns):
-            if abs(timestamp_ms - current.timestamp_ms) > window_ms:
-                continue
-            if current.source == source and transcripts_look_same(current.text, text):
-                return self.remove_turn(current.turn_id)
+            self.turns[index] = marked
+            if self._summary_through_timestamp_ms >= marked.timestamp_ms:
+                self._summary = ""
+                self._summary_through_turn_id = ""
+                self._summary_through_timestamp_ms = 0
+            self._refresh_active_topic()
+            return marked
         return None
 
     def remember_question(self, question_id: str, question: str, timestamp_ms: int | None = None) -> None:
@@ -239,8 +240,16 @@ class DialogueMemory:
 
     def build_context(self, session_id: str, question_id: str, question: str, confidence: float) -> ContextSnapshot:
         self._prune()
-        remote = [turn.text for turn in self.turns if turn.source == REMOTE_SOURCE and turn.is_final][-8:]
-        user = [turn.text for turn in self.turns if turn.source == MIC_SOURCE and turn.is_final][-6:]
+        remote = [
+            format_context_turn(turn)
+            for turn in self.turns
+            if turn.source == REMOTE_SOURCE and turn.is_final
+        ][-8:]
+        user = [
+            format_context_turn(turn)
+            for turn in self.turns
+            if turn.source == MIC_SOURCE and turn.is_final
+        ][-6:]
         excerpt = "\n".join(format_turn(turn) for turn in self.turns[-16:] if turn.is_final)
         prior_exchanges = [exchange for exchange in self.exchanges if exchange.question_id != question_id][-5:]
         return ContextSnapshot(
@@ -295,13 +304,21 @@ class DialogueMemory:
 
     def summary_source(self, max_chars: int = SUMMARY_MAX_SOURCE_CHARS) -> tuple[str, str, int]:
         self._prune()
-        final_turns = [turn for turn in self.turns if turn.is_final]
+        final_turns = [
+            turn
+            for turn in self.turns
+            if turn.is_final and not turn.uncertain
+        ]
         if not final_turns:
             return "", "", 0
         lines = [format_turn(turn) for turn in final_turns]
         transcript = select_recent_lines(lines, max_chars)
         last_turn = final_turns[-1]
         return transcript, last_turn.turn_id, last_turn.timestamp_ms
+
+    def turn_is_uncertain(self, turn_id: str) -> bool:
+        index = self._turn_index(turn_id)
+        return index is not None and self.turns[index].uncertain
 
     def set_summary(self, text: str, through_turn_id: str, through_timestamp_ms: int) -> None:
         normalized = text.strip()
@@ -329,6 +346,8 @@ class DialogueMemory:
                     "source": turn.source,
                     "text": turn.text,
                     "isFinal": turn.is_final,
+                    "uncertain": turn.uncertain,
+                    "startedAtMs": turn.started_at_ms,
                     "timestampMs": turn.timestamp_ms,
                 }
                 for turn in self.turns
@@ -384,14 +403,22 @@ class DialogueMemory:
     def _refresh_active_topic(self) -> None:
         topic = ""
         for turn in self.turns:
-            if turn.source == REMOTE_SOURCE and turn.is_final:
+            if turn.source == REMOTE_SOURCE and turn.is_final and not turn.uncertain:
                 topic = infer_topic(turn.text, topic)
         self.active_topic = topic
 
 
 def format_turn(turn: DialogueTurn) -> str:
     speaker = "Собеседник" if turn.source == REMOTE_SOURCE else "Пользователь"
+    if turn.uncertain:
+        speaker += " (сомнительная расшифровка)"
     return f"{speaker}: {turn.text}"
+
+
+def format_context_turn(turn: DialogueTurn) -> str:
+    if turn.uncertain:
+        return f"[сомнительная расшифровка] {turn.text}"
+    return turn.text
 
 
 _SPOKEN_TOKEN_EQUIVALENTS = {
@@ -410,32 +437,6 @@ _SPOKEN_TOKEN_EQUIVALENTS = {
     "плюс": "+",
     "минус": "-",
 }
-
-
-def transcripts_look_same(left: str, right: str) -> bool:
-    left_tokens = normalize_transcript_tokens(left)
-    right_tokens = normalize_transcript_tokens(right)
-    if not left_tokens or not right_tokens:
-        return False
-    if min(len(left_tokens), len(right_tokens)) < 2 and min(len("".join(left_tokens)), len("".join(right_tokens))) < 8:
-        return False
-    if left_tokens == right_tokens:
-        return True
-
-    left_symbols = {token for token in left_tokens if token.isdigit() or token in {"+", "-", "*", "/"}}
-    right_symbols = {token for token in right_tokens if token.isdigit() or token in {"+", "-", "*", "/"}}
-    if left_symbols != right_symbols:
-        return False
-
-    left_text = " ".join(left_tokens)
-    right_text = " ".join(right_tokens)
-    if SequenceMatcher(None, left_text, right_text).ratio() >= 0.88:
-        return True
-
-    left_set = set(left_tokens)
-    right_set = set(right_tokens)
-    common = len(left_set & right_set)
-    return common >= 2 and common / max(len(left_set), len(right_set)) >= 0.85
 
 
 def normalize_transcript_tokens(text: str) -> list[str]:

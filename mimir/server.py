@@ -321,7 +321,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 after = int(snapshot["eventSequence"])
                 self.wfile.write(sse_payload(SessionEvent(after, "session_snapshot", snapshot)))
                 self.wfile.flush()
-            for event in SESSION_MANAGER.listen(after=after):
+            for event in SESSION_MANAGER.listen(after=after, recover_gap=True):
                 self.wfile.write(sse_payload(event))
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -738,7 +738,11 @@ def run_wav_stt_job(job_id: str, source: str, language: str, chunk_duration_ms: 
         SESSION_MANAGER.record_audio_speech_started(source)
         SESSION_MANAGER.record_audio_chunk(source, len(data))
         for event in runner.run(source, chunks):
-            SESSION_MANAGER.record_stt_result(event.source, event.is_final)
+            SESSION_MANAGER.record_stt_result(
+                event.source,
+                event.is_final,
+                is_refinement=event.is_refinement,
+            )
             SESSION_MANAGER.ingest_transcript(
                 event.source,
                 event.text,

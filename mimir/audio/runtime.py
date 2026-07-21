@@ -26,6 +26,8 @@ def start_live_audio_locked(
 ) -> dict[str, object]:
     mode, common_config = parse_request(payload)
     stop_all_audio_locked(dependencies)
+    ensure_audio_threads_stopped(dependencies)
+
     if mode == "speechkit":
         dependencies.session_manager.set_answer_provider_override(None)
         key = dependencies.read_secret("yandex_speechkit") or dependencies.read_secret("yandex_ai_studio") or ""
@@ -44,6 +46,17 @@ def start_live_audio_locked(
         return dependencies.realtime_audio.start(realtime_config, key, config.yandex_folder_id)
     except ProviderError as error:
         return start_cloud_audio_fallback_locked(realtime_config, str(error), dependencies)
+
+
+def ensure_audio_threads_stopped(dependencies: AudioRuntimeDependencies) -> None:
+    for controller in (
+        dependencies.realtime_audio,
+        dependencies.live_audio,
+        dependencies.local_audio,
+    ):
+        has_live_threads = getattr(controller, "has_live_threads", None)
+        if callable(has_live_threads) and has_live_threads():
+            raise ValueError("Предыдущий звуковой поток еще завершается")
 
 
 def audio_is_running(dependencies: AudioRuntimeDependencies) -> bool:
@@ -115,6 +128,7 @@ def start_cloud_audio_fallback_locked(
     dependencies: AudioRuntimeDependencies,
 ) -> dict[str, object]:
     stop_all_audio_locked(dependencies)
+    ensure_audio_threads_stopped(dependencies)
     dependencies.session_manager.set_answer_provider_override(None)
     dependencies.session_manager.publish_status(
         "audio_status",
@@ -140,6 +154,7 @@ def start_local_audio_fallback_locked(
     dependencies: AudioRuntimeDependencies,
 ) -> dict[str, object]:
     stop_all_audio_locked(dependencies)
+    ensure_audio_threads_stopped(dependencies)
     dependencies.session_manager.set_answer_provider_override(None)
     dependencies.session_manager.publish_status(
         "audio_status",
@@ -165,4 +180,5 @@ def copy_live_audio_config(config: RealtimeAudioConfig | LiveAudioConfig) -> Liv
         device_ids=dict(config.device_ids),
         application_process_id=config.application_process_id,
         record_testing=config.record_testing,
+        mic_gain=float(getattr(config, "mic_gain", 2.0)),
     )

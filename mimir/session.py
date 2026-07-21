@@ -29,6 +29,7 @@ from .session_types import (
 
 
 SessionEventSink = Callable[[str, dict[str, Any]], None]
+MISSING_STT_WARNING_DELAY_SECONDS = 4.0
 
 
 class SessionManager(SessionAnswerFlow):
@@ -54,6 +55,12 @@ class SessionManager(SessionAnswerFlow):
         self._answer_provider_override: str | None = None
         self._current_question: dict[str, Any] | None = None
         self._current_answer_text = ""
+        self._speech_sequences: dict[str, int] = {}
+        self._ended_speech_sequences: dict[str, list[int]] = {}
+        self._finalized_speech_sequences: dict[str, set[int]] = {}
+        self._warned_speech_sequences: dict[str, set[int]] = {}
+        self._last_final_transcript_sequences: dict[str, int] = {}
+        self._active_stt_sequences: dict[str, int] = {}
         self._event_sinks: list[SessionEventSink] = []
         if event_sink is not None:
             self._event_sinks.append(event_sink)
@@ -84,6 +91,12 @@ class SessionManager(SessionAnswerFlow):
             self._candidate_sequence = 0
             self._current_question = None
             self._current_answer_text = ""
+            self._speech_sequences = {}
+            self._ended_speech_sequences = {}
+            self._finalized_speech_sequences = {}
+            self._warned_speech_sequences = {}
+            self._last_final_transcript_sequences = {}
+            self._active_stt_sequences = {}
             self._summary.reset(self._generation, self._session_id)
             self.reset_metrics_locked()
             self._state = "listening"
@@ -134,9 +147,17 @@ class SessionManager(SessionAnswerFlow):
         is_final: bool = True,
         detect_question: bool = True,
         is_refinement: bool = False,
+        timestamp_ms: int | None = None,
+        started_at_ms: int | None = None,
     ) -> dict[str, Any]:
         source = normalize_source(source)
-        turn = DialogueTurn(source=source, text=text, is_final=is_final)
+        turn = DialogueTurn(
+            source=source,
+            text=text,
+            is_final=is_final,
+            timestamp_ms=timestamp_ms if timestamp_ms is not None else wall_ms(),
+            started_at_ms=started_at_ms or 0,
+        )
         with self._condition:
             if self._state in {"paused", "stopped"}:
                 return {
@@ -144,6 +165,7 @@ class SessionManager(SessionAnswerFlow):
                     "source": turn.source,
                     "text": turn.text,
                     "isFinal": turn.is_final,
+                    "startedAtMs": turn.started_at_ms,
                     "timestampMs": turn.timestamp_ms,
                     "skipped": True,
                     "reason": self._state,
@@ -151,36 +173,6 @@ class SessionManager(SessionAnswerFlow):
             if self._state == "idle":
                 self._state = "listening"
                 self.publish_locked("session_state", self.snapshot_locked())
-            duplicate = self._memory.find_cross_source_duplicate(turn) if turn.is_final else None
-            if duplicate is not None and turn.source == MIC_SOURCE:
-                removed = self._memory.remove_latest_matching_turn(
-                    MIC_SOURCE,
-                    turn.text,
-                    timestamp_ms=turn.timestamp_ms,
-                )
-                if removed is not None:
-                    self._publish_transcript_removal_locked(removed, duplicate.turn_id)
-                trace_live_event(
-                    "session.transcript_skipped",
-                    source=turn.source,
-                    text=turn.text,
-                    reason="cross_source_duplicate",
-                    duplicateOf=duplicate.turn_id,
-                )
-                return {
-                    "sessionId": self._session_id,
-                    "source": turn.source,
-                    "text": turn.text,
-                    "isFinal": turn.is_final,
-                    "timestampMs": turn.timestamp_ms,
-                    "skipped": True,
-                    "reason": "cross_source_duplicate",
-                    "duplicateOf": duplicate.turn_id,
-                }
-            if duplicate is not None and duplicate.source == MIC_SOURCE:
-                removed = self._memory.remove_turn(duplicate.turn_id)
-                if removed is not None:
-                    self._publish_transcript_removal_locked(removed, turn.turn_id)
             update = self._memory.append(turn, refine_latest=is_refinement)
             if update is None:
                 return {
@@ -188,6 +180,7 @@ class SessionManager(SessionAnswerFlow):
                     "source": turn.source,
                     "text": turn.text,
                     "isFinal": turn.is_final,
+                    "startedAtMs": turn.started_at_ms,
                     "timestampMs": turn.timestamp_ms,
                     "skipped": True,
                     "reason": "empty",
@@ -201,6 +194,8 @@ class SessionManager(SessionAnswerFlow):
                 "source": turn.source,
                 "text": turn.text,
                 "isFinal": turn.is_final,
+                "uncertain": turn.uncertain,
+                "startedAtMs": turn.started_at_ms,
                 "timestampMs": turn.timestamp_ms,
                 "operation": update.operation,
                 "memoryWindowMs": self._memory.retention_ms,
@@ -209,12 +204,14 @@ class SessionManager(SessionAnswerFlow):
             trace_live_event(
                 "session.transcript",
                 source=turn.source,
+                turnId=turn.turn_id,
                 text=turn.text,
                 isFinal=turn.is_final,
                 operation=update.operation,
                 isRefinement=is_refinement,
                 detectQuestion=detect_question,
                 timestampMs=turn.timestamp_ms,
+                startedAtMs=turn.started_at_ms,
             )
             summary_source = (
                 self._generation,
@@ -222,34 +219,21 @@ class SessionManager(SessionAnswerFlow):
                 self._memory.summary,
                 *self._memory.summary_source(),
             ) if turn.is_final else None
+            question_utterance_sequence = (
+                self._last_final_transcript_sequences.get(turn.source, 0)
+                if turn.is_final
+                else 0
+            )
 
         if detect_question and turn.source == REMOTE_SOURCE and turn.is_final:
-            self._schedule_remote_utterance(turn.text, turn.timestamp_ms)
+            self._schedule_remote_utterance(
+                turn.text,
+                turn.timestamp_ms,
+                question_utterance_sequence,
+            )
         if summary_source is not None:
-            self._summary.observe(*summary_source)
+            self._summary.observe(*summary_source, force=is_refinement)
         return payload
-
-    def _publish_transcript_removal_locked(self, turn: DialogueTurn, duplicate_of: str) -> None:
-        payload = {
-            "sessionId": self._session_id,
-            "turnId": turn.turn_id,
-            "source": turn.source,
-            "text": "",
-            "isFinal": turn.is_final,
-            "timestampMs": turn.timestamp_ms,
-            "operation": "remove",
-            "memoryWindowMs": self._memory.retention_ms,
-            "duplicateOf": duplicate_of,
-        }
-        self.publish_locked("transcript", payload)
-        trace_live_event(
-            "session.transcript_removed",
-            source=turn.source,
-            text=turn.text,
-            turnId=turn.turn_id,
-            reason="cross_source_duplicate",
-            duplicateOf=duplicate_of,
-        )
 
     def publish_status(self, event: str, payload: dict[str, Any]) -> None:
         self._publish(event, payload)
@@ -279,21 +263,159 @@ class SessionManager(SessionAnswerFlow):
         with self._condition:
             if self._state in {"paused", "stopped"}:
                 return
-            self._metric_store.record_speech_started(self._session_id, source)
+            self._speech_sequences[source] = self._speech_sequences.get(source, 0) + 1
+            self._metric_store.record_speech_started(
+                self._session_id,
+                source,
+                self._speech_sequences[source],
+            )
+
+    def record_audio_speech_ended(self, source: str, *, trailing_silence_ms: int = 0) -> None:
+        source = normalize_source(source)
+        with self._condition:
+            if self._state in {"paused", "stopped"}:
+                return
+            speech_sequence = self._speech_sequences.get(source, 0)
+            self._metric_store.record_speech_ended(
+                self._session_id,
+                source,
+                trailing_silence_ms,
+                speech_sequence,
+            )
+            generation = self._generation
+            session_id = self._session_id
+            if speech_sequence > 0:
+                ended = self._ended_speech_sequences.setdefault(source, [])
+                if speech_sequence not in ended:
+                    ended.append(speech_sequence)
+        if speech_sequence <= 0:
+            return
+        timer = threading.Timer(
+            MISSING_STT_WARNING_DELAY_SECONDS,
+            self._check_missing_stt_utterance,
+            args=(generation, session_id, source, speech_sequence),
+        )
+        timer.daemon = True
+        timer.start()
 
     def record_audio_chunk(self, source: str, byte_count: int) -> None:
         source = normalize_source(source)
         with self._condition:
             if self._state in {"paused", "stopped"}:
                 return
-            self._metric_store.record_audio_chunk(self._session_id, source, byte_count)
+            self._metric_store.record_audio_chunk(
+                self._session_id,
+                source,
+                byte_count,
+                self._speech_sequences.get(source, 0),
+            )
 
-    def record_stt_result(self, source: str, is_final: bool) -> None:
+    def record_stt_result(
+        self,
+        source: str,
+        is_final: bool,
+        *,
+        is_refinement: bool = False,
+    ) -> int:
         source = normalize_source(source)
         with self._condition:
             if self._state in {"paused", "stopped"}:
+                return 0
+            if is_refinement:
+                return 0
+            speech_sequence = self._speech_sequences.get(source, 0)
+            if not is_final:
+                active_sequence = self._active_stt_sequences.get(source, 0)
+                ended = self._ended_speech_sequences.get(source, [])
+                finalized = self._finalized_speech_sequences.get(source, set())
+                if speech_sequence > 0 and (
+                    active_sequence <= 0
+                    or active_sequence in finalized
+                    or (
+                        speech_sequence > active_sequence
+                        and active_sequence in ended
+                    )
+                ):
+                    self._active_stt_sequences[source] = speech_sequence
+            if is_final:
+                ended = self._ended_speech_sequences.get(source, [])
+                finalized = self._finalized_speech_sequences.setdefault(source, set())
+                warned = self._warned_speech_sequences.setdefault(source, set())
+                candidates = [
+                    sequence
+                    for sequence in ended
+                    if sequence not in finalized
+                ]
+                if speech_sequence > 0 and speech_sequence not in finalized:
+                    if speech_sequence not in candidates:
+                        candidates.append(speech_sequence)
+                active_sequence = self._active_stt_sequences.get(source, 0)
+                if active_sequence in warned:
+                    self._active_stt_sequences.pop(source, None)
+                    active_sequence = 0
+                if active_sequence > 0 and active_sequence not in finalized:
+                    speech_sequence = active_sequence
+                else:
+                    speech_sequence = next(
+                        (sequence for sequence in candidates if sequence not in warned),
+                        candidates[0] if candidates else speech_sequence,
+                    )
+            self._metric_store.record_stt_result(
+                self._session_id,
+                source,
+                is_final,
+                speech_sequence,
+            )
+            if is_final:
+                if speech_sequence > 0:
+                    finalized.add(speech_sequence)
+                    if self._active_stt_sequences.get(source) == speech_sequence:
+                        self._active_stt_sequences.pop(source, None)
+                    self._last_final_transcript_sequences[source] = speech_sequence
+                    if speech_sequence in warned:
+                        warned.remove(speech_sequence)
+                        self._metric_store.decrement("missingSttUtterances")
+                        self._metric_store.increment("lateSttRecoveries")
+                        self.publish_locked(
+                            "stt_recovered",
+                            {
+                                "sessionId": self._session_id,
+                                "source": source,
+                                "message": "Распознавание вернуло запоздавший текст",
+                            },
+                        )
+            return speech_sequence
+
+    def _check_missing_stt_utterance(
+        self,
+        generation: int,
+        session_id: str,
+        source: str,
+        speech_sequence: int,
+    ) -> None:
+        with self._condition:
+            if (
+                generation != self._generation
+                or session_id != self._session_id
+                or self._state in {"paused", "stopped"}
+                or speech_sequence in self._finalized_speech_sequences.get(source, set())
+                or speech_sequence in self._warned_speech_sequences.get(source, set())
+            ):
                 return
-            self._metric_store.record_stt_result(self._session_id, source, is_final)
+            self._warned_speech_sequences.setdefault(source, set()).add(speech_sequence)
+            self._metric_store.increment("missingSttUtterances")
+            payload = {
+                "sessionId": self._session_id,
+                "source": source,
+                "message": "Речь была слышна, но распознавание не вернуло текст",
+            }
+            self.publish_locked("stt_warning", payload)
+        trace_live_event(
+            "stt.missing_utterance",
+            sessionId=session_id,
+            source=source,
+            speechSequence=speech_sequence,
+        )
 
     def record_external_question(
         self,
@@ -303,6 +425,7 @@ class SessionManager(SessionAnswerFlow):
         confidence: float = 1.0,
         provider: str = "external",
         source: str = REMOTE_SOURCE,
+        utterance_sequence: int = 0,
     ) -> None:
         source = normalize_source(source)
         now = time.monotonic()
@@ -319,6 +442,7 @@ class SessionManager(SessionAnswerFlow):
                 context_started=now,
                 context_done=now,
                 provider=provider,
+                utterance_sequence=utterance_sequence,
             )
             self.add_question_metric_locked(metric, question_ready_at=now)
             self._memory.remember_question(question_id, question, wall_ms())
@@ -385,22 +509,57 @@ class SessionManager(SessionAnswerFlow):
             )
             return self._state == "answering" or answer_running or candidate_pending
 
-    def listen(self, after: int = 0) -> Iterator[SessionEvent]:
+    def listen(self, after: int = 0, *, recover_gap: bool = False) -> Iterator[SessionEvent]:
         cursor = after
         while True:
             with self._condition:
-                event = self.next_event_locked(cursor)
-                if event is None:
-                    self._condition.wait(timeout=15)
+                snapshot = self._snapshot_if_event_gap_locked(cursor) if recover_gap else None
+                if snapshot is not None:
+                    event = SessionEvent(
+                        int(snapshot["eventSequence"]),
+                        "session_snapshot",
+                        snapshot,
+                    )
+                else:
                     event = self.next_event_locked(cursor)
-                if event is None:
-                    self._sequence += 1
-                    event = SessionEvent(self._sequence, "heartbeat", {"state": self._state})
-                    self._events.append(event)
-                    self._events = self._events[-300:]
-                    self._condition.notify_all()
+                    if event is None:
+                        self._condition.wait(timeout=15)
+                        snapshot = (
+                            self._snapshot_if_event_gap_locked(cursor)
+                            if recover_gap
+                            else None
+                        )
+                        event = (
+                            SessionEvent(
+                                int(snapshot["eventSequence"]),
+                                "session_snapshot",
+                                snapshot,
+                            )
+                            if snapshot is not None
+                            else self.next_event_locked(cursor)
+                        )
+                    if event is None:
+                        self._sequence += 1
+                        event = SessionEvent(self._sequence, "heartbeat", {"state": self._state})
+                        self._events.append(event)
+                        self._events = self._events[-300:]
+                        self._condition.notify_all()
                 cursor = event.sequence
             yield event
+
+    def snapshot_if_event_gap(self, after: int) -> dict[str, Any] | None:
+        with self._condition:
+            return self._snapshot_if_event_gap_locked(after)
+
+    def _snapshot_if_event_gap_locked(self, after: int) -> dict[str, Any] | None:
+        if after > self._sequence:
+            return self.snapshot_locked()
+        if not self._events:
+            return self.snapshot_locked() if after < self._sequence else None
+        earliest_sequence = self._events[0].sequence
+        if after < earliest_sequence - 1:
+            return self.snapshot_locked()
+        return None
 
     def add_event_sink(self, sink: SessionEventSink) -> None:
         with self._condition:
@@ -455,12 +614,20 @@ class SessionManager(SessionAnswerFlow):
         through_turn_id: str,
         through_timestamp_ms: int,
         _requested_revision: int,
-    ) -> None:
+    ) -> bool:
         with self._condition:
             if generation != self._generation or session_id != self._session_id:
-                return
+                return False
             if self._state in {"paused", "stopped"}:
-                return
+                return False
+            if self._memory.turn_is_uncertain(through_turn_id):
+                trace_live_event(
+                    "session.context_summary_skipped",
+                    sessionId=self._session_id,
+                    reason="uncertain_turn",
+                    throughTurnId=through_turn_id,
+                )
+                return False
             self._memory.set_summary(summary, through_turn_id, through_timestamp_ms)
             self.publish_locked(
                 "context_summary",
@@ -470,6 +637,7 @@ class SessionManager(SessionAnswerFlow):
                     "throughTurnId": through_turn_id,
                 },
             )
+            return True
 
     def metrics_locked(self) -> dict[str, Any]:
         return self._metric_store.payload(
@@ -490,6 +658,7 @@ class SessionManager(SessionAnswerFlow):
         context_started: float,
         context_done: float,
         provider: str,
+        utterance_sequence: int = 0,
     ) -> dict[str, Any]:
         return self._metric_store.build_question(
             session_id=self._session_id,
@@ -503,6 +672,7 @@ class SessionManager(SessionAnswerFlow):
             context_done=context_done,
             provider=provider,
             cancelled_streams=self._cancelled_streams,
+            utterance_sequence=utterance_sequence,
         )
 
     def add_question_metric_locked(self, metric: dict[str, Any], *, question_ready_at: float) -> None:

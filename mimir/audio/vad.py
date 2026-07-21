@@ -29,6 +29,7 @@ class VadDecision:
     rms: int
     speech_started: bool = False
     speech_ended: bool = False
+    trailing_silence_ms: int = 0
     audio_chunks: tuple[bytes, ...] = ()
     speech_threshold: int = 0
     silence_threshold: int = 0
@@ -74,6 +75,7 @@ class EnergyVadGate:
                 silence_threshold,
                 is_speech=False,
                 speech_ended=ended,
+                trailing_silence_ms=self.silence_ms if ended else 0,
                 audio_chunks=(pcm,),
             )
             if ended:
@@ -130,6 +132,7 @@ class EnergyVadGate:
         is_speech: bool,
         speech_started: bool = False,
         speech_ended: bool = False,
+        trailing_silence_ms: int = 0,
         audio_chunks: tuple[bytes, ...] = (),
     ) -> VadDecision:
         return VadDecision(
@@ -138,6 +141,7 @@ class EnergyVadGate:
             rms=rms,
             speech_started=speech_started,
             speech_ended=speech_ended,
+            trailing_silence_ms=trailing_silence_ms,
             audio_chunks=audio_chunks,
             speech_threshold=speech_threshold,
             silence_threshold=silence_threshold,
