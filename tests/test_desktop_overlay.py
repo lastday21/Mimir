@@ -1,7 +1,11 @@
+import contextlib
+import io
+import os
 import unittest
+import uuid
 
 import mimir.desktop as desktop
-from mimir.desktop import DesktopWindowController
+from mimir.desktop import DesktopWindowController, SingleInstanceGuard, shutdown_desktop_runtime
 from mimir.hotkeys import (
     MOD_CONTROL,
     MOD_SHIFT,
@@ -71,6 +75,54 @@ class DesktopOverlayTests(unittest.TestCase):
             desktop.toggle_live_audio = original_toggle_live_audio
 
         self.assertEqual(calls, [True])
+
+    def test_shutdown_stops_session_before_server(self) -> None:
+        original_stop_live_session = desktop.stop_live_session
+        events: list[str] = []
+
+        class FakeServer:
+            def stop(self) -> None:
+                events.append("server")
+
+        desktop.stop_live_session = lambda: events.append("session") or {"state": "stopped"}
+        try:
+            shutdown_desktop_runtime(FakeServer())  # type: ignore[arg-type]
+        finally:
+            desktop.stop_live_session = original_stop_live_session
+
+        self.assertEqual(events, ["session", "server"])
+
+    def test_shutdown_stops_server_when_session_stop_fails(self) -> None:
+        original_stop_live_session = desktop.stop_live_session
+        events: list[str] = []
+
+        class FakeServer:
+            def stop(self) -> None:
+                events.append("server")
+
+        def fail() -> dict[str, object]:
+            raise RuntimeError("stop failed")
+
+        desktop.stop_live_session = fail
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                shutdown_desktop_runtime(FakeServer())  # type: ignore[arg-type]
+        finally:
+            desktop.stop_live_session = original_stop_live_session
+
+        self.assertEqual(events, ["server"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows named mutex")
+    def test_single_instance_guard_rejects_second_owner(self) -> None:
+        name = f"Local\\mimir-test-{uuid.uuid4()}"
+        first = SingleInstanceGuard(name)
+        second = SingleInstanceGuard(name)
+        try:
+            self.assertTrue(first.acquire())
+            self.assertFalse(second.acquire())
+        finally:
+            second.release()
+            first.release()
 
 
 if __name__ == "__main__":

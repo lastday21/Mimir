@@ -1,21 +1,82 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import http.client
+import os
 import subprocess
 import sys
 import threading
 from collections.abc import Callable
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import app_data_dir, load_config
 from .hotkeys import HotkeySpec, WindowsHotkeyController, audio_hotkey, overlay_hotkey
-from .server import HOST, STATIC_ROOT, create_server, toggle_live_audio
+from .server import HOST, STATIC_ROOT, create_server, stop_live_session, toggle_live_audio
 
 
 APP_TITLE = "Mimir"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SINGLE_INSTANCE_MUTEX = "Local\\io.github.lastday21.mimir"
+ERROR_ALREADY_EXISTS = 183
+
+
+class SingleInstanceGuard:
+    def __init__(self, name: str = SINGLE_INSTANCE_MUTEX) -> None:
+        self.name = name
+        self._kernel32: object | None = None
+        self._handle: object | None = None
+
+    def acquire(self) -> bool:
+        if os.name != "nt":
+            return True
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        self._kernel32 = kernel32
+        self._handle = handle
+        return True
+
+    def release(self) -> None:
+        kernel32 = self._kernel32
+        handle = self._handle
+        self._kernel32 = None
+        self._handle = None
+        if kernel32 is not None and handle is not None:
+            kernel32.CloseHandle(handle)
+
+    def __enter__(self) -> "SingleInstanceGuard":
+        if not self.acquire():
+            raise RuntimeError("Mimir уже запущен")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.release()
+
+
+def show_already_running_message() -> None:
+    message = "Mimir уже запущен. Закройте открытое окно перед повторным запуском."
+    if os.name != "nt":
+        print(message, file=sys.stderr)
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+        user32.MessageBoxW.restype = ctypes.c_int
+        user32.MessageBoxW(None, message, APP_TITLE, 0x40)
+    except OSError:
+        print(message, file=sys.stderr)
 
 
 @dataclass
@@ -43,6 +104,15 @@ class DesktopServer:
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)
+
+
+def shutdown_desktop_runtime(server: DesktopServer) -> None:
+    try:
+        stop_live_session()
+    except Exception as error:
+        print(f"Не удалось полностью остановить звук Mimir: {error}", file=sys.stderr)
+    finally:
+        server.stop()
 
 
 def ensure_frontend_build(auto_build: bool) -> None:
@@ -187,7 +257,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    instance = SingleInstanceGuard()
     try:
+        if not args.check and not instance.acquire():
+            show_already_running_message()
+            return 2
         ensure_frontend_build(auto_build=not args.no_build)
         server = DesktopServer(args.host, args.port)
         server.start()
@@ -198,10 +272,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             open_window(server.url, args.debug)
         finally:
-            server.stop()
+            shutdown_desktop_runtime(server)
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"Failed to start Mimir desktop: {error}", file=sys.stderr)
         return 1
+    finally:
+        instance.release()
     return 0
 
 
